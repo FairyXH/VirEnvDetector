@@ -6,13 +6,14 @@ android {
     namespace = "io.github.fairyxh.VirEnvDetector"
     compileSdk = 36
     buildToolsVersion = "36.1.0"
+    val gitVersion = GitVersion.getVersion()
 
     defaultConfig {
         applicationId = "io.github.fairyxh.VirEnvDetector"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionName = gitVersion[0]
+        versionCode = gitVersion[1].toInt()
     }
 
     buildTypes {
