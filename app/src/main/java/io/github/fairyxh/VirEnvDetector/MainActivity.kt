@@ -89,6 +89,8 @@ class MainActivity : Activity() {
     private lateinit var sensorStatus: TextView
     private lateinit var gnssView: TextView
     private lateinit var gnssStatus: TextView
+    private lateinit var simView: TextView
+    private lateinit var simStatus: TextView
     private lateinit var playbackView: TextView
     private lateinit var playbackStatus: TextView
     private lateinit var startButton: Button
@@ -121,6 +123,8 @@ class MainActivity : Activity() {
     private var lastCellText: String = "无基站（等待读取）"
     @Volatile
     private var lastWifiText: String = "无扫描结果"
+    @Volatile
+    private var lastSimText: String = "无 SIM 数据（等待读取）"
     @Volatile
     private var lastStepCount: Long = -1L
     @Volatile
@@ -301,6 +305,9 @@ class MainActivity : Activity() {
         val gnss = section(container, "GNSS")
         gnssView = gnss.first
         gnssStatus = gnss.second
+        val sim = section(container, "SIM")
+        simView = sim.first
+        simStatus = sim.second
         val play = section(container, "录像/回放状态")
         playbackView = play.first
         playbackStatus = play.second
@@ -662,6 +669,22 @@ class MainActivity : Activity() {
         } catch (t: Throwable) {
             Log.w(TAG, "gnss read failed", t)
         }
+        try {
+            val text = formatSim()
+            lastSimText = text
+            val v = settleVerdict(judgeSim())
+            sb.append("sim: ").append(v.name).append(" | ").append(text).append('\n')
+            runOnUiThread {
+                simView.text = text
+                renderVerdict(simStatus, v)
+            }
+            report.put("sim", JSONObject().apply {
+                put("verdict", v.name)
+                put("data", text)
+            })
+        } catch (t: Throwable) {
+            Log.w(TAG, "sim read failed", t)
+        }
         renderPlayback(report)
         Log.i(TAG, sb.toString().trim())
         // 上报报告到模块 ApiServer
@@ -908,6 +931,48 @@ class MainActivity : Activity() {
         return if (satOk && usedOk) Verdict.PASS else Verdict.FAIL
     }
 
+    /** SIM 判定：配置任一卡槽的 mcc/mnc/运营商/IMSI/ICCID 出现在 App 读到文本中。 */
+    private fun judgeSim(): Verdict {
+        val data = envData("sim") ?: return Verdict.NOT_ENABLED
+        val slots = data.optJSONArray("slots") ?: return Verdict.FAIL
+        if (slots.length() == 0) return Verdict.FAIL
+        if (lastSimText.isBlank() || lastSimText.contains("无 SIM 数据")) return Verdict.FAIL
+        for (i in 0 until slots.length()) {
+            val s = slots.optJSONObject(i) ?: continue
+            var hit = 0
+            var total = 0
+            val mcc = s.optString("mcc", "")
+            if (mcc.isNotEmpty()) {
+                total++
+                if (lastSimText.contains(mcc)) hit++
+            }
+            val mnc = s.optString("mnc", "")
+            if (mnc.isNotEmpty()) {
+                total++
+                if (lastSimText.contains(mnc)) hit++
+            }
+            val operator = s.optString("simOperatorName", "").ifEmpty { s.optString("carrier", "") }
+            if (operator.isNotEmpty()) {
+                total++
+                if (lastSimText.contains(operator)) hit++
+            }
+            val imsi = s.optString("subscriberId", "")
+            if (imsi.isNotEmpty()) {
+                total++
+                if (lastSimText.contains(imsi)) hit++
+            }
+            val iccid = s.optString("simSerialNumber", "")
+            if (iccid.isNotEmpty()) {
+                total++
+                if (lastSimText.contains(iccid)) hit++
+            }
+            // 至少 2 项命中视为生效（运营商名称可能被 ROM 截断）
+            if (total >= 2 && hit >= 2) return Verdict.PASS
+            if (total == 1 && hit == 1) return Verdict.PASS
+        }
+        return Verdict.FAIL
+    }
+
     // ---------- 实读 ----------
 
     private fun readLastLocation(): Location? {
@@ -1048,6 +1113,45 @@ class MainActivity : Activity() {
         }
         if (top.isNotEmpty()) sb.append(top)
         return sb.toString()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun formatSim(): String {
+        val tm = telephonyManager ?: return "TelephonyManager 不可用"
+        val sb = StringBuilder()
+        try {
+            val subId = try { android.telephony.SubscriptionManager.getDefaultSubscriptionId() } catch (t: Throwable) { -1 }
+            val subTm = if (subId >= 0) tm.createForSubscriptionId(subId) else tm
+            sb.append("国家码: ").append(runCatching { subTm.simCountryIso }.getOrDefault("")).append('\n')
+            sb.append("运营商: ").append(runCatching { subTm.simOperatorName }.getOrDefault("")).append('\n')
+            sb.append("网络运营商: ").append(runCatching { subTm.networkOperatorName }.getOrDefault("")).append('\n')
+            sb.append("SIM 运营商代码: ").append(runCatching { subTm.simOperator }.getOrDefault("")).append('\n')
+            sb.append("网络代码: ").append(runCatching { subTm.networkOperator }.getOrDefault("")).append('\n')
+            sb.append("IMSI: ").append(runCatching { subTm.subscriberId }.getOrDefault("")).append('\n')
+            sb.append("ICCID: ").append(runCatching { subTm.simSerialNumber }.getOrDefault("")).append('\n')
+            sb.append("号码: ").append(runCatching { subTm.line1Number }.getOrDefault("")).append('\n')
+            sb.append("状态: ").append(runCatching { tm.simState }.getOrDefault(-1)).append('\n')
+            try {
+                val ss = tm.signalStrength
+                if (ss != null) {
+                    sb.append("信号 Lv:").append(runCatching { ss.level }.getOrDefault(-1))
+                    sb.append(" GSM:").append(runCatching { ss.gsmSignalStrength }.getOrDefault(Int.MIN_VALUE))
+                    if (Build.VERSION.SDK_INT >= 28) {
+                        val lte = ss.getCellSignalStrengths(android.telephony.CellSignalStrengthLte::class.java)
+                        if (lte.isNotEmpty()) sb.append(" LTE rsrp:").append(lte[0].dbm)
+                    }
+                    if (Build.VERSION.SDK_INT >= 29) {
+                        val nr = ss.getCellSignalStrengths(android.telephony.CellSignalStrengthNr::class.java)
+                        if (nr.isNotEmpty()) sb.append(" NR rsrp:").append(nr[0].dbm)
+                    }
+                    sb.append('\n')
+                }
+            } catch (_: Throwable) {
+            }
+        } catch (t: Throwable) {
+            sb.append("读取失败: ").append(t.message).append('\n')
+        }
+        return sb.toString().trim().ifEmpty { "无 SIM 数据（无卡或权限不足）" }
     }
 
     // ---------- 模块 ApiServer 客户端（带 token，raw TCP 绕开 Tun 代理） ----------

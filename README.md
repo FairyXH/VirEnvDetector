@@ -33,6 +33,7 @@ VirEnvDetector 作为独立第三方 App，被加入模块的 LSPosed 作用域�
 | wifi | `WifiManager.getScanResults()` | 期望 `networks` 中任一 ssid/bssid 出现在结果 |
 | sensor | `SensorManager` 计步器回调 | 期望 `stepFrequency`/`events` 启用且收到步数事件 |
 | gnss | `GnssStatus.Callback` | 期望卫星数/使用数 ≥ 80% 匹配虚拟状态 |
+| sim | `TelephonyManager`（createForSubscriptionId 读取国家码/运营商/IMSI/ICCID/信号） | 期望 `slots` 中任一卡槽的 mcc/mnc/运营商/IMSI/ICCID 命中实读文本 |
 
 每个检测项 UI 同时展示：
 - 实读数据明细（坐标/小区字段/设备列表/步数/卫星数）
