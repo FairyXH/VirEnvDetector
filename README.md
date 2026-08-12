@@ -5,6 +5,8 @@
 
 > 它是 ZhangVirtualEnv 生态的一部分，但作为独立 Gradle 工程维护（复用主模块的 Gradle/AGP 版本，避免与模块混淆）。
 
+> 该检测器需要和Lsposed模块搭配使用，用于为其检测虚拟环境是否生效：[ZhangVirtualEnv](https://github.com/FairyXH/ZhangVirtualEnv)
+
 ---
 
 ## 1. 为什么需要检测器
