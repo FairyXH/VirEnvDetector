@@ -867,18 +867,30 @@ class MainActivity : Activity() {
         val data = envData("cell") ?: return Verdict.NOT_ENABLED
         val entries = data.optJSONArray("entries") ?: return Verdict.FAIL
         if (entries.length() == 0) return Verdict.FAIL
+        // 哨兵值兜底：框架 UNAVAILABLE 哨兵泄漏视为 FAIL（nci=9223372036854775807 等）
+        if (lastCellText.contains("nci=unavail") || lastCellText.contains("ss=unavail")) {
+            return Verdict.FAIL
+        }
         for (i in 0 until entries.length()) {
             val e = entries.optJSONObject(i) ?: continue
             val mcc = e.optInt("mcc", -1)
             val mnc = e.optInt("mnc", -1)
             val tac = e.optLong("tac", -1L)
             val ci = e.optLong("ci", -1L)
+            val type = e.optString("type", "LTE").uppercase()
+            val nci = e.optLong("nci", -1L)
             if (mcc >= 0 && mnc >= 0 &&
                 lastCellText.contains("mcc=$mcc") && lastCellText.contains("mnc=$mnc")
             ) {
-                if (tac < 0 || ci < 0) return Verdict.PASS
-                if (lastCellText.contains("tac=$tac") && lastCellText.contains("ci=$ci")) {
-                    return Verdict.PASS
+                if (type == "NR") {
+                    // NR 主标识是 nci（36bit）；期望值合法时必须精确匹配
+                    if (nci < 0) return Verdict.PASS
+                    if (lastCellText.contains("nci=$nci")) return Verdict.PASS
+                } else {
+                    if (tac < 0 || ci < 0) return Verdict.PASS
+                    if (lastCellText.contains("tac=$tac") && lastCellText.contains("ci=$ci")) {
+                        return Verdict.PASS
+                    }
                 }
             }
         }
@@ -1044,6 +1056,18 @@ class MainActivity : Activity() {
             "\ntime=" + loc.time
     }
 
+    /** int 哨兵值（Integer.MAX_VALUE）显示为 unavail。 */
+    private fun fmtInt(v: Int?): String {
+        if (v == null || v == Int.MAX_VALUE) return "unavail"
+        return v.toString()
+    }
+
+    /** long 哨兵值（Long.MAX_VALUE / CellInfo.UNAVAILABLE_LONG）显示为 unavail。 */
+    private fun fmtLong(v: Long): String {
+        if (v == Long.MAX_VALUE || v == 2147483647L) return "unavail"
+        return v.toString()
+    }
+
     @Suppress("DEPRECATION")
     private fun formatCell(): String {
         val tm = telephonyManager ?: return "TelephonyManager 不可用"
@@ -1071,10 +1095,11 @@ class MainActivity : Activity() {
                     if (id != null) {
                         sb.append(" mcc=").append(id.mccString)
                             .append(" mnc=").append(id.mncString)
-                            .append(" tac=").append(id.tac)
-                            .append(" nci=").append(id.nci)
+                            .append(" tac=").append(fmtInt(id.tac))
+                            .append(" pci=").append(fmtInt(id.pci))
+                            .append(" nci=").append(fmtLong(id.nci))
                     }
-                    sb.append(" ss=").append(info.cellSignalStrength?.dbm).append('\n')
+                    sb.append(" ss=").append(fmtInt(info.cellSignalStrength?.dbm)).append('\n')
                 }
                 is CellInfoGsm -> {
                     val id = info.cellIdentity
