@@ -1506,6 +1506,12 @@ class MainActivity : Activity() {
             "\ntime=" + loc.time
     }
 
+    /** MCC/MNC 字符串：0..999 合法，越界/哨兵显示 unavail。 */
+    private fun fmtCellMccStr(v: String?): String {
+        val n = v?.toIntOrNull() ?: return "unavail"
+        return if (n in 0..999) n.toString() else "unavail"
+    }
+
     /** int 哨兵值（Integer.MAX_VALUE）显示为 unavail。 */
     private fun fmtInt(v: Int?): String {
         if (v == null || v == Int.MAX_VALUE) return "unavail"
@@ -1542,8 +1548,8 @@ class MainActivity : Activity() {
                 is CellInfoLte -> {
                     val id = info.cellIdentity
                     val sig = info.cellSignalStrength
-                    sb.append("LTE mcc=").append(id.mccString ?: "-1")
-                        .append(" mnc=").append(id.mncString ?: "-1")
+                    sb.append("LTE mcc=").append(fmtCellMccStr(id.mccString))
+                        .append(" mnc=").append(fmtCellMccStr(id.mncString))
                         .append(" tac=").append(fmtInt(id.tac))
                         .append(" ci=").append(fmtLong(id.ci.toLong()))
                         .append(" pci=").append(fmtInt(id.pci))
@@ -1578,8 +1584,8 @@ class MainActivity : Activity() {
                 is CellInfoGsm -> {
                     val id = info.cellIdentity
                     val sig = info.cellSignalStrength
-                    sb.append("GSM mcc=").append(id.mccString ?: "-1")
-                        .append(" mnc=").append(id.mncString ?: "-1")
+                    sb.append("GSM mcc=").append(fmtCellMccStr(id.mccString))
+                        .append(" mnc=").append(fmtCellMccStr(id.mncString))
                         .append(" lac=").append(fmtInt(id.lac))
                         .append(" cid=").append(fmtInt(id.cid))
                     reflectCellInt(id, "getBsic")?.let { if (it >= 0) sb.append(" bsic=").append(it) }
@@ -1601,8 +1607,8 @@ class MainActivity : Activity() {
                 is CellInfoWcdma -> {
                     val id = info.cellIdentity
                     val sig = info.cellSignalStrength
-                    sb.append("WCDMA mcc=").append(id.mccString ?: "-1")
-                        .append(" mnc=").append(id.mncString ?: "-1")
+                    sb.append("WCDMA mcc=").append(fmtCellMccStr(id.mccString))
+                        .append(" mnc=").append(fmtCellMccStr(id.mncString))
                         .append(" lac=").append(fmtInt(id.lac))
                         .append(" cid=").append(fmtInt(id.cid))
                     reflectCellInt(id, "getPsc")?.let { if (it >= 0) sb.append(" psc=").append(it) }
