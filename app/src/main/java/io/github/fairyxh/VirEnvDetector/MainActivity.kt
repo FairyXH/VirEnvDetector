@@ -5,6 +5,7 @@ import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -20,9 +21,11 @@ import android.location.LocationManager
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.telephony.CellInfo
 import android.telephony.CellInfoCdma
 import android.telephony.CellInfoGsm
@@ -37,7 +40,9 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import org.json.JSONObject
+import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -98,6 +103,7 @@ class MainActivity : Activity() {
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
     private lateinit var randomButton: Button
+    private lateinit var exportButton: Button
 
     private val running = AtomicBoolean(false)
     private val pendingRandom = AtomicBoolean(false)
@@ -106,6 +112,10 @@ class MainActivity : Activity() {
     }
     @Volatile
     private var refreshFuture: java.util.concurrent.ScheduledFuture<*>? = null
+
+    /** 最近一次完整检测报告（导出用）。 */
+    @Volatile
+    private var latestReport: JSONObject? = null
     private val refreshRunnable = object : Runnable {
         override fun run() {
             if (!running.get()) return
@@ -295,14 +305,17 @@ class MainActivity : Activity() {
         startButton = Button(this).apply { text = "开始检测" }
         stopButton = Button(this).apply { text = "结束" ; isEnabled = false }
         randomButton = Button(this).apply { text = "随机模拟" }
+        exportButton = Button(this).apply { text = "导出报告" }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         row.addView(startButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(randomButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(exportButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(stopButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         container.addView(row)
         startButton.setOnClickListener { onStartDetect() }
         randomButton.setOnClickListener { onRandomSimulate() }
         stopButton.setOnClickListener { onStopDetect() }
+        exportButton.setOnClickListener { onExportReport() }
 
         val loc = section(container, "位置")
         locationView = loc.first
@@ -702,6 +715,7 @@ class MainActivity : Activity() {
         }
         renderPlayback(report)
         report.put("hookObserve", hookObserveJson ?: JSONObject())
+        latestReport = report
         Log.i(TAG, sb.toString().trim())
         // 上报报告到模块 ApiServer
         try {
@@ -1217,6 +1231,83 @@ class MainActivity : Activity() {
             hookObserveStatus.text = "-"
             hookObserveStatus.setTextColor(gray)
             statusView.text = "已停止，结果已清空"
+        }
+    }
+
+    /** 导出完整检测报告：本地结果 + Hook 层观测 + 模块调试报告 + 设备信息。 */
+    private fun onExportReport() {
+        val report = latestReport
+        if (report == null) {
+            Toast.makeText(this, "暂无检测报告（请先开始检测）", Toast.LENGTH_SHORT).show()
+            return
+        }
+        refreshExecutor.execute {
+            try {
+                val moduleReport = try {
+                    apiGet("/api/report/export")
+                } catch (t: Throwable) {
+                    null
+                }
+                val full = JSONObject().apply {
+                    put("reportType", "detector")
+                    put("exportedAt", System.currentTimeMillis())
+                    put("device", JSONObject().apply {
+                        put("model", Build.MODEL)
+                        put("manufacturer", Build.MANUFACTURER)
+                        put("device", Build.DEVICE)
+                        put("product", Build.PRODUCT)
+                        put("fingerprint", Build.FINGERPRINT)
+                        put("sdk", Build.VERSION.SDK_INT)
+                        put("release", Build.VERSION.RELEASE)
+                    })
+                    put("detectorVersion", runCatching {
+                        packageManager.getPackageInfo(packageName, 0).versionName
+                    }.getOrDefault(""))
+                    moduleReport?.let { put("moduleReport", it) }
+                    put("result", report)
+                }
+                val name = "ZVE_DetectorReport_${System.currentTimeMillis()}.json"
+                val written = writeReportToDownloads(full, name)
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        if (written) "报告已导出：$name" else "导出失败（请检查存储/权限）",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+                Log.i(TAG, "report exported name=$name ok=$written size=${full.toString().length}")
+            } catch (t: Throwable) {
+                Log.w(TAG, "report export failed", t)
+            }
+        }
+    }
+
+    /** 写入 Download 目录：API 29+ 走 MediaStore，26-28 写应用专属外部目录（免权限）。 */
+    private fun writeReportToDownloads(json: JSONObject, fileName: String): Boolean {
+        return try {
+            val text = json.toString(2)
+            if (Build.VERSION.SDK_INT >= 29) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                    put(MediaStore.Downloads.MIME_TYPE, "application/json")
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: return false
+                contentResolver.openOutputStream(uri)?.use {
+                    it.write(text.toByteArray(StandardCharsets.UTF_8))
+                }
+                true
+            } else {
+                val dir = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "")
+                if (!dir.exists()) dir.mkdirs()
+                val f = File(dir, fileName)
+                f.writeText(text, StandardCharsets.UTF_8)
+                true
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "write report file failed", t)
+            false
         }
     }
 
