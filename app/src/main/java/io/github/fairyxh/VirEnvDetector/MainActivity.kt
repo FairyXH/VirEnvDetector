@@ -141,6 +141,14 @@ class MainActivity : Activity() {
     private var lastStepCount: Long = -1L
     @Volatile
     private var lastGnssStatus: GnssStatus? = null
+
+    /** 最近一次 NMEA 句子（GNSS NMEA 检测）。 */
+    @Volatile
+    private var lastNmeaText = ""
+
+    /** 蓝牙适配器身份文本（MAC/名称，BLE 身份检测）。 */
+    @Volatile
+    private var lastBtIdentityText = ""
     private val sensorRaw = ConcurrentHashMap<Int, String>()
     private val bleFound = LinkedHashMap<String, String>()
 
@@ -184,6 +192,14 @@ class MainActivity : Activity() {
         override fun onSatelliteStatusChanged(status: GnssStatus) {
             lastGnssStatus = status
             onRealtimeGnss(status)
+        }
+    }
+
+    /** NMEA 监听（虚拟定位启用时由模块注入虚拟 $GPRMC；OnNmeaMessageListener 需 API 30+）。 */
+    private val nmeaListener = object : android.location.OnNmeaMessageListener {
+        override fun onNmeaMessage(nmea: String, timestamp: Long) {
+            lastNmeaText = nmea
+            onRealtimeNmea()
         }
     }
     private val stepListener = object : SensorEventListener {
@@ -531,6 +547,13 @@ class MainActivity : Activity() {
             Log.w(TAG, "gnss register failed", t)
         }
         try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                lm?.addNmeaListener(nmeaListener)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "nmea register failed", t)
+        }
+        try {
             bleScanner?.startScan(bleScanCallback)
         } catch (t: Throwable) {
             Log.w(TAG, "ble startScan failed", t)
@@ -572,6 +595,12 @@ class MainActivity : Activity() {
         }
         try {
             locationManager?.removeUpdates(locationListener)
+        } catch (_: Throwable) {
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                locationManager?.removeNmeaListener(nmeaListener)
+            }
         } catch (_: Throwable) {
         }
         // 结束按钮：清空全部数据结果，并结束 Hook 层观测
@@ -932,11 +961,22 @@ class MainActivity : Activity() {
         val devices = data.optJSONArray("devices") ?: return Verdict.FAIL
         if (devices.length() == 0) return Verdict.FAIL
         val found: Set<String> = synchronized(bleFound) { bleFound.keys.toSet() }
+        var scanHit = false
         for (i in 0 until devices.length()) {
             val address = devices.optJSONObject(i)?.optString("address", "")?.uppercase()
-            if (!address.isNullOrBlank() && found.contains(address)) return Verdict.PASS
+            if (!address.isNullOrBlank() && found.contains(address)) {
+                scanHit = true
+                break
+            }
         }
-        return Verdict.FAIL
+        if (!scanHit) return Verdict.FAIL
+        // 蓝牙适配器身份：配置了 adapterMac/adapterName 时必须命中（BluetoothAdapter.getAddress/getName 虚拟化）
+        val mac = data.optString("adapterMac", "").uppercase()
+        val name = data.optString("adapterName", "")
+        if (mac.isEmpty() && name.isEmpty()) return Verdict.PASS
+        val text = lastBtIdentityText.uppercase()
+        val hit = (mac.isNotEmpty() && text.contains(mac)) || (name.isNotEmpty() && text.contains(name))
+        return if (hit) Verdict.PASS else Verdict.FAIL
     }
 
     private fun judgeWifi(): Verdict {
@@ -965,12 +1005,18 @@ class MainActivity : Activity() {
         val data = envData("gnss") ?: return Verdict.NOT_ENABLED
         val expectSat = data.optInt("satelliteCount", 0)
         val expectUsed = data.optInt("usedInFix", 0)
-        if (expectSat <= 0 && expectUsed <= 0) return Verdict.NOT_ENABLED
-        val status = lastGnssStatus ?: return Verdict.FAIL
-        val used = (0 until status.satelliteCount).count { status.usedInFix(it) }
-        val satOk = expectSat <= 0 || status.satelliteCount >= (expectSat * 0.8).toInt()
-        val usedOk = expectUsed <= 0 || used >= (expectUsed * 0.8).toInt()
-        return if (satOk && usedOk) Verdict.PASS else Verdict.FAIL
+        val expectNmea = data.optBoolean("nmeaEnabled", false)
+        if (expectSat <= 0 && expectUsed <= 0 && !expectNmea) return Verdict.NOT_ENABLED
+        // 虚拟 NMEA：期望启用时必须收到 $GPRMC（模块在 registerGnssNmeaCallback 拦截层注入）
+        if (expectNmea && !lastNmeaText.contains("\$GPRMC")) return Verdict.FAIL
+        if (expectSat > 0 || expectUsed > 0) {
+            val status = lastGnssStatus ?: return Verdict.FAIL
+            val used = (0 until status.satelliteCount).count { status.usedInFix(it) }
+            val satOk = expectSat <= 0 || status.satelliteCount >= (expectSat * 0.8).toInt()
+            val usedOk = expectUsed <= 0 || used >= (expectUsed * 0.8).toInt()
+            if (!satOk || !usedOk) return Verdict.FAIL
+        }
+        return Verdict.PASS
     }
 
     /** SIM 判定：对配置中每个设置了虚拟身份的卡槽，在其对应卡槽分段内比对 mcc/mnc/运营商/IMSI/ICCID。 */
@@ -1106,6 +1152,17 @@ class MainActivity : Activity() {
         }
     }
 
+    /** NMEA 回调实时计算判定（不等待刷新周期）。 */
+    private fun onRealtimeNmea() {
+        runOnUiThread {
+            if (!running.get()) return@runOnUiThread
+            val text = formatGnss()
+            val v = settleVerdict(judgeGnss())
+            gnssView.text = text
+            renderVerdict(gnssStatus, v)
+        }
+    }
+
     /** 传感器回调实时计算判定（高频事件节流到 400ms）。 */
     private fun onRealtimeSensor() {
         val now = SystemClock.elapsedRealtime()
@@ -1210,6 +1267,8 @@ class MainActivity : Activity() {
         configChangedAtMs = 0L
         lastSensorUiMs = 0L
         lastBleUiMs = 0L
+        lastNmeaText = ""
+        lastBtIdentityText = ""
         runOnUiThread {
             val gray = Color.parseColor("#9E9E9E")
             fun reset(view: TextView, status: TextView) {
@@ -1416,8 +1475,21 @@ class MainActivity : Activity() {
 
     private fun formatBle(): String {
         val found: List<String> = synchronized(bleFound) { bleFound.values.toList() }
-        if (found.isEmpty()) return "无 BLE 结果（等待扫描回调）"
-        return found.take(10).joinToString("\n")
+        val sb = StringBuilder()
+        // 蓝牙适配器身份：MAC/名称（虚拟化时由 system_server BluetoothManagerService 拦截）
+        try {
+            val adapter = BluetoothAdapter.getDefaultAdapter()
+            if (adapter != null) {
+                val addr = runCatching { adapter.address }.getOrDefault("")
+                val name = runCatching { adapter.name }.getOrDefault("")
+                sb.append("适配器: ").append(name).append(" / ").append(addr).append('\n')
+            }
+        } catch (t: Throwable) {
+            sb.append("适配器读取失败: ").append(t.message).append('\n')
+        }
+        if (found.isNotEmpty()) sb.append(found.take(10).joinToString("\n"))
+        lastBtIdentityText = sb.toString()
+        return sb.toString().trim().ifEmpty { "无 BLE 结果（等待扫描回调）" }
     }
 
     private fun formatWifi(): String {
@@ -1448,21 +1520,27 @@ class MainActivity : Activity() {
     }
 
     private fun formatGnss(): String {
-        val status = lastGnssStatus ?: return "GNSS 无回调（等待状态）"
-        val used = (0 until status.satelliteCount).count { status.usedInFix(it) }
         val sb = StringBuilder()
-        sb.append("卫星总数: ").append(status.satelliteCount)
-            .append(" 使用: ").append(used).append('\n')
-        val top = (0 until status.satelliteCount).take(12).joinToString("\n") { i ->
-            val cn0 = status.getCn0DbHz(i)
-            val svid = status.getSvid(i)
-            String.format(
-                Locale.US,
-                "sv%02d cn0=%.1f used=%s",
-                svid, cn0, if (status.usedInFix(i)) "Y" else "N"
-            )
+        val status = lastGnssStatus
+        if (status != null) {
+            val used = (0 until status.satelliteCount).count { status.usedInFix(it) }
+            sb.append("卫星总数: ").append(status.satelliteCount)
+                .append(" 使用: ").append(used).append('\n')
+            val top = (0 until status.satelliteCount).take(12).joinToString("\n") { i ->
+                val cn0 = status.getCn0DbHz(i)
+                val svid = status.getSvid(i)
+                String.format(
+                    Locale.US,
+                    "sv%02d cn0=%.1f used=%s",
+                    svid, cn0, if (status.usedInFix(i)) "Y" else "N"
+                )
+            }
+            if (top.isNotEmpty()) sb.append(top).append('\n')
+        } else {
+            sb.append("卫星: 无回调\n")
         }
-        if (top.isNotEmpty()) sb.append(top)
+        val nmea = lastNmeaText
+        sb.append(if (nmea.isBlank()) "NMEA: 未收到" else "NMEA: ").append(nmea.trim().take(80))
         return sb.toString()
     }
 
