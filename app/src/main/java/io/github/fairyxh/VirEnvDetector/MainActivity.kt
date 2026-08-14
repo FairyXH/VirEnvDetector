@@ -3,6 +3,9 @@ package io.github.fairyxh.VirEnvDetector
 import android.Manifest
 import android.app.Activity
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
+import android.content.Intent
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.ContentValues
@@ -151,6 +154,37 @@ class MainActivity : Activity() {
     private var lastBtIdentityText = ""
     private val sensorRaw = ConcurrentHashMap<Int, String>()
     private val bleFound = LinkedHashMap<String, String>()
+    /** 经典发现（ACTION_FOUND）收集结果：address -> "name address rssi class" */
+    private val classicFound = LinkedHashMap<String, String>()
+    private val classicReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: android.content.Context?, intent: Intent?) {
+            if (intent?.action != BluetoothDevice.ACTION_FOUND) return
+            val device: BluetoothDevice? = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+            }
+            if (device == null) return
+            val name = intent.getStringExtra(BluetoothDevice.EXTRA_NAME) ?: device.name ?: "(no name)"
+            val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE)
+            val cls = if (android.os.Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_CLASS, android.bluetooth.BluetoothClass::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(BluetoothDevice.EXTRA_CLASS)
+            }
+            val line = "$name ${device.address} ${rssi}dBm" + (if (cls != null) " class=${cls.deviceClass}" else "")
+            synchronized(bleFound) {
+                classicFound[device.address] = line
+                while (classicFound.size > BLE_RESULTS_LIMIT) {
+                    val it = classicFound.entries.iterator()
+                    if (it.hasNext()) it.remove()
+                }
+            }
+            onRealtimeBle()
+        }
+    }
 
     // ---- 虚拟期望（拉自 ApiServer） ----
     @Volatile
@@ -558,6 +592,18 @@ class MainActivity : Activity() {
         } catch (t: Throwable) {
             Log.w(TAG, "ble startScan failed", t)
         }
+        // 经典发现：注册 ACTION_FOUND 并主动 startDiscovery（蓝牙栈 Hook 会投递虚拟经典设备）
+        try {
+            val filter = android.content.IntentFilter(BluetoothDevice.ACTION_FOUND)
+            registerReceiver(classicReceiver, filter)
+        } catch (_: Throwable) {
+        }
+        synchronized(bleFound) { classicFound.clear() }
+        try {
+            BluetoothAdapter.getDefaultAdapter()?.startDiscovery()
+        } catch (t: Throwable) {
+            Log.w(TAG, "classic startDiscovery failed", t)
+        }
         try {
             wifiManager?.startScan()
         } catch (_: Throwable) {
@@ -591,6 +637,14 @@ class MainActivity : Activity() {
         }
         try {
             bleScanner?.stopScan(bleScanCallback)
+        } catch (_: Throwable) {
+        }
+        try {
+            BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery()
+        } catch (_: Throwable) {
+        }
+        try {
+            unregisterReceiver(classicReceiver)
         } catch (_: Throwable) {
         }
         try {
@@ -999,10 +1053,18 @@ class MainActivity : Activity() {
         val devices = data.optJSONArray("devices") ?: return Verdict.FAIL
         if (devices.length() == 0) return Verdict.FAIL
         val found: Set<String> = synchronized(bleFound) { bleFound.keys.toSet() }
+        val classic: Set<String> = synchronized(bleFound) { classicFound.keys.toSet() }
         var scanHit = false
         for (i in 0 until devices.length()) {
-            val address = devices.optJSONObject(i)?.optString("address", "")?.uppercase()
-            if (!address.isNullOrBlank() && found.contains(address)) {
+            val d = devices.optJSONObject(i) ?: continue
+            val address = d.optString("address", "").uppercase()
+            if (address.isBlank()) continue
+            val mode = d.optString("mode", "ble").lowercase()
+            if (found.contains(address)) {
+                scanHit = true
+                break
+            }
+            if ((mode == "classic" || mode == "dual") && classic.contains(address)) {
                 scanHit = true
                 break
             }
@@ -1554,6 +1616,7 @@ class MainActivity : Activity() {
 
     private fun formatBle(): String {
         val found: List<String> = synchronized(bleFound) { bleFound.values.toList() }
+        val classic: List<String> = synchronized(bleFound) { classicFound.values.toList() }
         val sb = StringBuilder()
         // 蓝牙适配器身份：MAC/名称（虚拟化时由 system_server BluetoothManagerService 拦截）
         try {
@@ -1567,6 +1630,7 @@ class MainActivity : Activity() {
             sb.append("适配器读取失败: ").append(t.message).append('\n')
         }
         if (found.isNotEmpty()) sb.append(found.take(10).joinToString("\n"))
+        if (classic.isNotEmpty()) sb.append("\n[经典] ").append(classic.take(10).joinToString("\n[经典] "))
         lastBtIdentityText = sb.toString()
         return sb.toString().trim().ifEmpty { "无 BLE 结果（等待扫描回调）" }
     }
