@@ -1547,7 +1547,7 @@ class MainActivity : Activity() {
                         .append(" tac=").append(fmtInt(id.tac))
                         .append(" ci=").append(fmtLong(id.ci.toLong()))
                         .append(" pci=").append(fmtInt(id.pci))
-                    reflectCellInt(id, "getEarfcn")?.let { if (it >= 0) sb.append(" earfcn=").append(it) }
+                    reflectCellInt(id, "getEarfcn")?.let { if (it in 0..262143) sb.append(" earfcn=").append(it) }
                     if (sig != null) {
                         sb.append(" rsrp=").append(fmtInt(reflectCellInt(sig, "getRsrp")))
                         sb.append(" rsrq=").append(fmtInt(reflectCellInt(sig, "getRsrq")))
@@ -1566,7 +1566,7 @@ class MainActivity : Activity() {
                             .append(" tac=").append(fmtInt(id.tac))
                             .append(" nci=").append(fmtLong(id.nci))
                             .append(" pci=").append(fmtInt(id.pci))
-                        reflectCellInt(id, "getNrArfcn")?.let { if (it >= 0) sb.append(" nrArfcn=").append(it) }
+                        reflectCellInt(id, "getNrArfcn")?.let { if (it in 0..3279165) sb.append(" nrArfcn=").append(it) }
                     }
                     if (sig != null) {
                         sb.append(" ssRsrp=").append(fmtInt(reflectCellInt(sig, "getSsRsrp")))
