@@ -93,6 +93,8 @@ class MainActivity : Activity() {
     private lateinit var simStatus: TextView
     private lateinit var playbackView: TextView
     private lateinit var playbackStatus: TextView
+    private lateinit var hookObserveView: TextView
+    private lateinit var hookObserveStatus: TextView
     private lateinit var startButton: Button
     private lateinit var stopButton: Button
     private lateinit var randomButton: Button
@@ -146,6 +148,16 @@ class MainActivity : Activity() {
     @Volatile
     private var lastPlaybackFrame = -1
 
+    // ---- Hook 层观测（模块 /api/debug/observe/snapshot） ----
+    @Volatile
+    private var hookObserveJson: JSONObject? = null
+
+    // ---- 实时刷新节流（高频回调不每次刷 UI） ----
+    @Volatile
+    private var lastSensorUiMs = 0L
+    @Volatile
+    private var lastBleUiMs = 0L
+
     // ---- 配置变更感知：期望配置变化后给 Hook 层 EnvStateCache 同步留宽限期 ----
     @Volatile
     private var configChangedAtMs: Long = 0L
@@ -155,17 +167,20 @@ class MainActivity : Activity() {
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
             lastLocation = location
+            onRealtimeLocation(location)
         }
     }
     private val gnssCallback = object : GnssStatus.Callback() {
         override fun onSatelliteStatusChanged(status: GnssStatus) {
             lastGnssStatus = status
+            onRealtimeGnss(status)
         }
     }
     private val stepListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent) {
             if (event.sensor.type == Sensor.TYPE_STEP_COUNTER && event.values.isNotEmpty()) {
                 lastStepCount = event.values[0].toLong()
+                onRealtimeSensor()
             }
         }
 
@@ -175,6 +190,7 @@ class MainActivity : Activity() {
         override fun onSensorChanged(event: SensorEvent) {
             val vals = event.values.joinToString(", ") { String.format(Locale.US, "%.3f", it) }
             sensorRaw[event.sensor.type] = "${event.sensor.name} [$vals]"
+            onRealtimeSensor()
         }
 
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
@@ -191,6 +207,7 @@ class MainActivity : Activity() {
                     if (it.hasNext()) it.remove()
                 }
             }
+            onRealtimeBle()
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -311,6 +328,9 @@ class MainActivity : Activity() {
         val play = section(container, "录像/回放状态")
         playbackView = play.first
         playbackStatus = play.second
+        val observe = section(container, "Hook 层观测")
+        hookObserveView = observe.first
+        hookObserveStatus = observe.second
         return root
     }
 
@@ -508,9 +528,14 @@ class MainActivity : Activity() {
         }
 
         Log.i(TAG, "detector listeners registered")
+        // 立即拉取期望配置 + 开启 Hook 层观测（后台执行，不阻塞 UI）
+        refreshExecutor.execute {
+            apiPost("/api/debug/observe/start", JSONObject())
+            refreshExpectations()
+        }
         refreshFuture = refreshExecutor.scheduleWithFixedDelay(
             refreshRunnable,
-            500,
+            100,
             REFRESH_MS,
             java.util.concurrent.TimeUnit.MILLISECONDS
         )
@@ -523,7 +548,6 @@ class MainActivity : Activity() {
         refreshFuture = null
         startButton.isEnabled = true
         stopButton.isEnabled = false
-        statusView.text = "已停止（最后一次快照保留）"
         try {
             sensorManager?.unregisterListener(stepListener)
             sensorManager?.unregisterListener(rawSensorListener)
@@ -537,7 +561,12 @@ class MainActivity : Activity() {
             locationManager?.removeUpdates(locationListener)
         } catch (_: Throwable) {
         }
-        Log.i(TAG, "detector stopped")
+        // 结束按钮：清空全部数据结果，并结束 Hook 层观测
+        clearResults()
+        refreshExecutor.execute {
+            apiPost("/api/debug/observe/end", JSONObject())
+        }
+        Log.i(TAG, "detector stopped and results cleared")
     }
 
     override fun onDestroy() {
@@ -546,28 +575,14 @@ class MainActivity : Activity() {
     }
 
     private fun refreshAll() {
-        // 拉取期望配置（失败保留上次，判 NOT_ENABLED）
+        // 实时同步期望配置（失败保留上次，判 NOT_ENABLED）
+        refreshExpectations()
         try {
-            val env = apiGet("/api/env/status")
-            if (env != null) expectEnv = env
+            val obs = apiGet("/api/debug/observe/snapshot")
+            if (obs != null) hookObserveJson = obs
         } catch (_: Throwable) {
         }
-        try {
-            val loc = apiGet("/api/location/status")
-            if (loc != null) expectLocation = loc
-        } catch (_: Throwable) {
-        }
-        try {
-            val route = apiGet("/api/route/status")
-            if (route != null) expectRoute = route
-        } catch (_: Throwable) {
-        }
-        try {
-            val ps = apiGet("/api/recording/status")
-            if (ps != null) playbackStatusJson = ps
-        } catch (_: Throwable) {
-        }
-        trackConfigChange()
+        renderObserve()
 
         val report = JSONObject().apply {
             put("timestamp", System.currentTimeMillis())
@@ -686,6 +701,7 @@ class MainActivity : Activity() {
             Log.w(TAG, "sim read failed", t)
         }
         renderPlayback(report)
+        report.put("hookObserve", hookObserveJson ?: JSONObject())
         Log.i(TAG, sb.toString().trim())
         // 上报报告到模块 ApiServer
         try {
@@ -1027,6 +1043,183 @@ class MainActivity : Activity() {
         return null
     }
 
+    // ---------- 实时同步与 Hook 层观测 ----------
+
+    /** 拉取期望配置（env/location/route/recording）并跟踪变更。 */
+    private fun refreshExpectations() {
+        try {
+            val env = apiGet("/api/env/status")
+            if (env != null) expectEnv = env
+        } catch (_: Throwable) {
+        }
+        try {
+            val loc = apiGet("/api/location/status")
+            if (loc != null) expectLocation = loc
+        } catch (_: Throwable) {
+        }
+        try {
+            val route = apiGet("/api/route/status")
+            if (route != null) expectRoute = route
+        } catch (_: Throwable) {
+        }
+        try {
+            val ps = apiGet("/api/recording/status")
+            if (ps != null) playbackStatusJson = ps
+        } catch (_: Throwable) {
+        }
+        trackConfigChange()
+    }
+
+    /** 位置回调实时计算判定（不等待 1s 刷新周期）。 */
+    private fun onRealtimeLocation(location: Location) {
+        runOnUiThread {
+            if (!running.get()) return@runOnUiThread
+            val text = formatLocation(location)
+            val v = settleVerdict(judgeLocation(location))
+            locationView.text = text
+            renderVerdict(locationStatus, v)
+        }
+    }
+
+    /** GNSS 回调实时计算判定。 */
+    private fun onRealtimeGnss(status: GnssStatus) {
+        runOnUiThread {
+            if (!running.get()) return@runOnUiThread
+            val text = formatGnss()
+            val v = settleVerdict(judgeGnss())
+            gnssView.text = text
+            renderVerdict(gnssStatus, v)
+        }
+    }
+
+    /** 传感器回调实时计算判定（高频事件节流到 400ms）。 */
+    private fun onRealtimeSensor() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastSensorUiMs < 400L) return
+        lastSensorUiMs = now
+        runOnUiThread {
+            if (!running.get()) return@runOnUiThread
+            val text = formatSensor()
+            val v = settleVerdict(judgeSensor())
+            sensorView.text = text
+            renderVerdict(sensorStatus, v)
+        }
+    }
+
+    /** BLE 回调实时计算判定（高频扫描节流到 500ms）。 */
+    private fun onRealtimeBle() {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastBleUiMs < 500L) return
+        lastBleUiMs = now
+        runOnUiThread {
+            if (!running.get()) return@runOnUiThread
+            val text = formatBle()
+            val v = settleVerdict(judgeBle())
+            bleView.text = text
+            renderVerdict(bleStatus, v)
+        }
+    }
+
+    /** 渲染 Hook 层观测快照（Hook 点最近经手的真实数据）。 */
+    private fun renderObserve() {
+        val obs = hookObserveJson ?: run {
+            runOnUiThread {
+                hookObserveView.text = "未获取 Hook 层观测（API 不可达）"
+                hookObserveStatus.text = "未知"
+                hookObserveStatus.setTextColor(Color.parseColor("#9E9E9E"))
+            }
+            return
+        }
+        val active = obs.optBoolean("active", false)
+        val loc = obs.optJSONObject("location")
+        val cells = obs.optJSONArray("cells")
+        val wifi = obs.optJSONArray("wifi")
+        val gnss = obs.optJSONObject("gnss")
+        val sb = StringBuilder()
+        if (loc != null) {
+            sb.append("真实位置: ")
+                .append(String.format(
+                    Locale.US,
+                    "%.6f, %.6f",
+                    loc.optDouble("latitude"),
+                    loc.optDouble("longitude")
+                ))
+                .append(" (").append(loc.optString("provider")).append(")\n")
+        }
+        if (cells != null && cells.length() > 0) {
+            val c0 = cells.optJSONObject(0)
+            sb.append("基站: ").append(cells.length()).append(" 个")
+            if (c0 != null) {
+                sb.append(" (").append(c0.optString("type"))
+                    .append(" mcc=").append(c0.optInt("mcc"))
+                    .append(" mnc=").append(c0.optInt("mnc")).append(')')
+            }
+            sb.append('\n')
+        }
+        if (wifi != null && wifi.length() > 0) {
+            sb.append("WiFi: ").append(wifi.length()).append(" 个\n")
+        }
+        if (gnss != null) {
+            sb.append("GNSS: ").append(gnss.optInt("satelliteCount"))
+                .append(" 颗 / 使用 ").append(gnss.optInt("usedInFix")).append('\n')
+        }
+        if (sb.isEmpty()) {
+            sb.append("暂无观测数据（开始检测后 Hook 点持续记录真实数据）")
+        }
+        val text = sb.toString().trim()
+        val statusText = if (active) "观测中" else "已停止"
+        val statusColor = if (active) Color.parseColor("#EF6C00") else Color.parseColor("#9E9E9E")
+        runOnUiThread {
+            hookObserveView.text = text
+            hookObserveStatus.text = statusText
+            hookObserveStatus.setTextColor(statusColor)
+        }
+    }
+
+    /** 结束检测后清空全部数据结果（修复：结束按钮应清空而非保留最后一次快照）。 */
+    private fun clearResults() {
+        lastLocation = null
+        lastCellText = "无基站（等待读取）"
+        lastWifiText = "无扫描结果"
+        lastSimText = "无 SIM 数据（等待读取）"
+        lastStepCount = -1L
+        lastGnssStatus = null
+        sensorRaw.clear()
+        synchronized(bleFound) { bleFound.clear() }
+        expectEnv = null
+        expectLocation = null
+        expectRoute = null
+        playbackStatusJson = null
+        hookObserveJson = null
+        lastPlaybackFrame = -1
+        lastExpectFingerprint = ""
+        configChangedAtMs = 0L
+        lastSensorUiMs = 0L
+        lastBleUiMs = 0L
+        runOnUiThread {
+            val gray = Color.parseColor("#9E9E9E")
+            fun reset(view: TextView, status: TextView) {
+                view.text = "未开始"
+                status.text = "-"
+                status.setTextColor(gray)
+            }
+            reset(locationView, locationStatus)
+            reset(cellView, cellStatus)
+            reset(bleView, bleStatus)
+            reset(wifiView, wifiStatus)
+            reset(sensorView, sensorStatus)
+            reset(gnssView, gnssStatus)
+            reset(simView, simStatus)
+            playbackView.text = "未开始"
+            playbackStatus.text = "-"
+            playbackStatus.setTextColor(gray)
+            hookObserveView.text = "未开始"
+            hookObserveStatus.text = "-"
+            hookObserveStatus.setTextColor(gray)
+            statusView.text = "已停止，结果已清空"
+        }
+    }
+
     // ---------- 实读 ----------
 
     private fun readLastLocation(): Location? {
@@ -1082,8 +1275,8 @@ class MainActivity : Activity() {
             when (info) {
                 is CellInfoLte -> {
                     val id = info.cellIdentity
-                    sb.append("LTE mcc=").append(id.mcc)
-                        .append(" mnc=").append(id.mnc)
+                    sb.append("LTE mcc=").append(id.mccString ?: "-1")
+                        .append(" mnc=").append(id.mncString ?: "-1")
                         .append(" tac=").append(id.tac)
                         .append(" ci=").append(id.ci)
                         .append(" pci=").append(id.pci)
@@ -1103,8 +1296,8 @@ class MainActivity : Activity() {
                 }
                 is CellInfoGsm -> {
                     val id = info.cellIdentity
-                    sb.append("GSM mcc=").append(id.mcc)
-                        .append(" mnc=").append(id.mnc)
+                    sb.append("GSM mcc=").append(id.mccString ?: "-1")
+                        .append(" mnc=").append(id.mncString ?: "-1")
                         .append(" lac=").append(id.lac)
                         .append(" cid=").append(id.cid)
                         .append(" asu=").append(info.cellSignalStrength?.asuLevel).append('\n')
@@ -1116,8 +1309,8 @@ class MainActivity : Activity() {
                 }
                 is CellInfoWcdma -> {
                     val id = info.cellIdentity
-                    sb.append("WCDMA mcc=").append(id.mcc)
-                        .append(" mnc=").append(id.mnc)
+                    sb.append("WCDMA mcc=").append(id.mccString ?: "-1")
+                        .append(" mnc=").append(id.mncString ?: "-1")
                         .append(" lac=").append(id.lac)
                         .append(" cid=").append(id.cid)
                         .append(" asu=").append(info.cellSignalStrength?.asuLevel).append('\n')
