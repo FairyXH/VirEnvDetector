@@ -69,6 +69,10 @@ class MainActivity : Activity() {
         private const val REFRESH_MS = 1000L
         private const val BLE_RESULTS_LIMIT = 20
         private const val BASE_URL = "http://127.0.0.1:18790"
+
+        /** 上次检测是否运行中（进程被杀后重开自动恢复）。 */
+        private const val PREFS_NAME = "vir_env_detector"
+        private const val KEY_WAS_RUNNING = "was_running"
         private val REQUIRED_PERMS = buildList {
             add(Manifest.permission.ACCESS_FINE_LOCATION)
             add(Manifest.permission.ACCESS_COARSE_LOCATION)
@@ -76,6 +80,8 @@ class MainActivity : Activity() {
             add(Manifest.permission.BLUETOOTH_CONNECT)
             add(Manifest.permission.ACCESS_WIFI_STATE)
             add(Manifest.permission.READ_PHONE_STATE)
+            // 计步器/步态传感器注册需要 ACTIVITY_RECOGNITION（Android 10+ 强制）
+            add(Manifest.permission.ACTIVITY_RECOGNITION)
             if (Build.VERSION.SDK_INT >= 31) add(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
     }
@@ -293,6 +299,18 @@ class MainActivity : Activity() {
         setContentView(buildUi())
         Log.i(TAG, "VirEnvDetector started pkg=${packageName} token=${if (apiToken.isEmpty()) "MISSING" else "loaded len=${apiToken.length} head=${apiToken.take(8)}"}")
         checkRootAsync()
+        // 自动恢复上次检测状态：进程被划掉/被杀后重开，无需手动重新点「开始」。
+        // 传感器/计步数据从系统层全局通道持续推送，这里只负责重新注册监听器继续展示。
+        try {
+            val wasRunning = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(KEY_WAS_RUNNING, false)
+            if (wasRunning) {
+                Log.i(TAG, "auto-resume detector from saved running state")
+                onStartDetect()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "auto-resume failed", t)
+        }
     }
 
     /** 后台检测 Root 可用性（su -c id）。 */
@@ -365,7 +383,16 @@ class MainActivity : Activity() {
         container.addView(row)
         startButton.setOnClickListener { onStartDetect() }
         randomButton.setOnClickListener { onRandomSimulate() }
-        stopButton.setOnClickListener { onStopDetect() }
+        stopButton.setOnClickListener {
+            // 用户主动结束：清除自动恢复标记（区别于进程被划掉/杀死的 onDestroy）
+            try {
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                    .edit().putBoolean(KEY_WAS_RUNNING, false).apply()
+            } catch (t: Throwable) {
+                Log.w(TAG, "clear running state failed", t)
+            }
+            onStopDetect()
+        }
         exportButton.setOnClickListener { onExportReport() }
 
         val loc = section(container, "位置")
@@ -519,6 +546,13 @@ class MainActivity : Activity() {
 
     private fun doStart() {
         running.set(true)
+        // 持久化运行状态：进程被划掉/被杀后重开自动恢复检测
+        try {
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .edit().putBoolean(KEY_WAS_RUNNING, true).apply()
+        } catch (t: Throwable) {
+            Log.w(TAG, "save running state failed", t)
+        }
         startButton.isEnabled = false
         stopButton.isEnabled = true
         statusView.text = "检测中…（每秒刷新 + 上报报告）"
