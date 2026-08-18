@@ -221,6 +221,13 @@ class MainActivity : Activity() {
     private var configChangedAtMs: Long = 0L
     private var lastExpectFingerprint: String = ""
     private val SYNC_GRACE_MS = 2000L
+    private val SYNC_TIMEOUT_MS = 8000L
+    @Volatile
+    private var detectorStartedAtMs: Long = 0L
+    @Volatile
+    private var lastGnssStatusAtMs: Long = 0L
+    @Volatile
+    private var lastNmeaAtMs: Long = 0L
 
     private val locationListener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
@@ -231,6 +238,7 @@ class MainActivity : Activity() {
     private val gnssCallback = object : GnssStatus.Callback() {
         override fun onSatelliteStatusChanged(status: GnssStatus) {
             lastGnssStatus = status
+            lastGnssStatusAtMs = SystemClock.elapsedRealtime()
             onRealtimeGnss(status)
         }
     }
@@ -239,6 +247,7 @@ class MainActivity : Activity() {
     private val nmeaListener = object : android.location.OnNmeaMessageListener {
         override fun onNmeaMessage(nmea: String, timestamp: Long) {
             lastNmeaText = nmea
+            lastNmeaAtMs = SystemClock.elapsedRealtime()
             onRealtimeNmea()
         }
     }
@@ -567,7 +576,11 @@ class MainActivity : Activity() {
         sensorRaw.clear()
         synchronized(bleFound) { bleFound.clear() }
         lastStepCount = -1L
+        detectorStartedAtMs = SystemClock.elapsedRealtime()
+        lastGnssStatusAtMs = 0L
+        lastNmeaAtMs = 0L
         lastGnssStatus = null
+        lastNmeaText = ""
 
         val sm = sensorManager
         try {
@@ -1148,10 +1161,20 @@ class MainActivity : Activity() {
         val expectUsed = data.optInt("usedInFix", 0)
         val expectNmea = data.optBoolean("nmeaEnabled", false)
         if (expectSat <= 0 && expectUsed <= 0 && !expectNmea) return Verdict.NOT_ENABLED
-        // 虚拟 NMEA：期望启用时必须收到 $GPRMC（模块在 registerGnssNmeaCallback 拦截层注入）
-        if (expectNmea && !lastNmeaText.contains("\$GPRMC")) return Verdict.FAIL
+        // 虚拟 NMEA：配置要求但尚未收到时，先进入有界等待状态；超时后明确失败。
+        if (expectNmea && !lastNmeaText.contains("\$GPRMC")) {
+            val age = SystemClock.elapsedRealtime() - detectorStartedAtMs
+            if (age > SYNC_TIMEOUT_MS) return Verdict.FAIL
+            return Verdict.SYNCING
+        }
         if (expectSat > 0 || expectUsed > 0) {
-            val status = lastGnssStatus ?: return Verdict.FAIL
+            val status = lastGnssStatus ?: run {
+                val age = SystemClock.elapsedRealtime() - detectorStartedAtMs
+                return if (age > SYNC_TIMEOUT_MS) Verdict.FAIL else Verdict.SYNCING
+            }
+            if (lastGnssStatusAtMs == 0L || SystemClock.elapsedRealtime() - lastGnssStatusAtMs > SYNC_TIMEOUT_MS) {
+                return Verdict.FAIL
+            }
             val used = (0 until status.satelliteCount).count { status.usedInFix(it) }
             val satOk = expectSat <= 0 || status.satelliteCount >= (expectSat * 0.8).toInt()
             val usedOk = expectUsed <= 0 || used >= (expectUsed * 0.8).toInt()
@@ -1733,12 +1756,27 @@ class MainActivity : Activity() {
             sb.append("卫星总数: ").append(status.satelliteCount)
                 .append(" 使用: ").append(used).append('\n')
             val top = (0 until status.satelliteCount).take(12).joinToString("\n") { i ->
-                val cn0 = status.getCn0DbHz(i)
+            val cn0 = status.getCn0DbHz(i)
+                val constellation = status.getConstellationType(i)
+                    val frequency = if (Build.VERSION.SDK_INT >= 26 && status.hasCarrierFrequencyHz(i)) {
+                        val hz = status.getCarrierFrequencyHz(i)
+                        if (hz > 0f) hz / 1_000_000f else Float.NaN
+                    } else Float.NaN
+                val frequencyRaw = if (Build.VERSION.SDK_INT >= 26) {
+                    "has=${status.hasCarrierFrequencyHz(i)} hz=${status.getCarrierFrequencyHz(i)}"
+                } else "api<26"
+                val flags = buildString {
+                    if (status.hasAlmanacData(i)) append("A")
+                    if (status.hasEphemerisData(i)) append("E")
+                    if (status.usedInFix(i)) append("U")
+                }.ifEmpty { "-" }
                 val svid = status.getSvid(i)
                 String.format(
                     Locale.US,
-                    "sv%02d cn0=%.1f used=%s",
-                    svid, cn0, if (status.usedInFix(i)) "Y" else "N"
+                    "sv%02d c=%d az=%.1f el=%.1f cn0=%.1f f=%sMHz [%s] %s",
+                    svid, constellation, status.getAzimuthDegrees(i),
+                    status.getElevationDegrees(i), cn0,
+                    if (frequency.isNaN()) "-" else "%.2f".format(Locale.US, frequency), frequencyRaw, flags
                 )
             }
             if (top.isNotEmpty()) sb.append(top).append('\n')
