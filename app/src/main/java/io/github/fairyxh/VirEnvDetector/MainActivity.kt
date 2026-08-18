@@ -230,8 +230,7 @@ class MainActivity : Activity() {
             synchronized(bleFound) {
                 classicFound[device.address] = line
                 while (classicFound.size > BLE_RESULTS_LIMIT) {
-                    val it = classicFound.entries.iterator()
-                    if (it.hasNext()) it.remove()
+                    classicFound.keys.firstOrNull()?.let(classicFound::remove)
                 }
             }
             onRealtimeBle()
@@ -325,8 +324,7 @@ class MainActivity : Activity() {
             synchronized(bleFound) {
                 bleFound[device.address] = line
                 while (bleFound.size > BLE_RESULTS_LIMIT) {
-                    val it = bleFound.entries.iterator()
-                    if (it.hasNext()) it.remove()
+                    bleFound.keys.firstOrNull()?.let(bleFound::remove)
                 }
             }
             onRealtimeBle()
