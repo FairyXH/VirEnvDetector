@@ -35,6 +35,9 @@ import android.telephony.CellInfoGsm
 import android.telephony.CellInfoLte
 import android.telephony.CellInfoNr
 import android.telephony.CellInfoWcdma
+import android.telephony.PhoneStateListener
+import android.telephony.ServiceState
+import android.telephony.SignalStrength
 import android.telephony.TelephonyManager
 import android.util.Log
 import android.view.Gravity
@@ -137,6 +140,49 @@ class MainActivity : Activity() {
     private var wifiManager: WifiManager? = null
     private var sensorManager: SensorManager? = null
     private var bleScanner: android.bluetooth.le.BluetoothLeScanner? = null
+
+    /** 连续电话状态证据：用于识别 Android 17 Xiaomi 的服务态/信号态跳变。 */
+    private val telephonyStateExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "VirEnvDetectorTelephony").apply { isDaemon = true }
+    }
+    private val telephonySamples = ArrayDeque<String>()
+    private val telephonySamplesLock = Any()
+    @Volatile private var lastServiceStateText = "unknown"
+    @Volatile private var lastSignalLevel = -1
+    @Volatile private var telephonyListenerRegistered = false
+    private val telephonyListener = object : PhoneStateListener(telephonyStateExecutor) {
+        @Deprecated("Android callback compatibility")
+        override fun onServiceStateChanged(serviceState: ServiceState?) {
+            lastServiceStateText = serviceState?.let {
+                val dataState = runCatching {
+                    it.javaClass.getMethod("getDataRegState").invoke(it) as Int
+                }.getOrElse {
+                    runCatching { it.javaClass.getMethod("getDataRegistrationState").invoke(it) as Int }.getOrDefault(-1)
+                }
+                "voice=${it.state} data=$dataState"
+            } ?: "null"
+            appendTelephonySample("service:$lastServiceStateText")
+        }
+
+        @Deprecated("Android callback compatibility")
+        override fun onSignalStrengthsChanged(signalStrength: SignalStrength?) {
+            lastSignalLevel = runCatching { signalStrength?.level ?: -1 }.getOrDefault(-1)
+            appendTelephonySample("signal:level=$lastSignalLevel")
+        }
+    }
+
+    private fun appendTelephonySample(sample: String) {
+        synchronized(telephonySamplesLock) {
+            if (telephonySamples.size >= 60) telephonySamples.removeFirst()
+            telephonySamples.addLast("${SystemClock.elapsedRealtime()}:$sample")
+        }
+        Log.i(TAG, "telephony callback $sample")
+    }
+
+    private fun telephonyStabilityText(): String {
+        val samples = synchronized(telephonySamplesLock) { telephonySamples.size }
+        return "callbacks=$samples lastService=$lastServiceStateText lastLevel=$lastSignalLevel"
+    }
 
     @Volatile
     private var lastLocation: Location? = null
@@ -581,6 +627,19 @@ class MainActivity : Activity() {
         lastNmeaAtMs = 0L
         lastGnssStatus = null
         lastNmeaText = ""
+        synchronized(telephonySamplesLock) { telephonySamples.clear() }
+        lastServiceStateText = "unknown"
+        lastSignalLevel = -1
+        try {
+            @Suppress("DEPRECATION")
+            telephonyManager?.listen(
+                telephonyListener,
+                PhoneStateListener.LISTEN_SERVICE_STATE or PhoneStateListener.LISTEN_SIGNAL_STRENGTHS
+            )
+            telephonyListenerRegistered = true
+        } catch (t: Throwable) {
+            Log.w(TAG, "telephony state listener register failed", t)
+        }
 
         val sm = sensorManager
         try {
@@ -699,6 +758,15 @@ class MainActivity : Activity() {
             locationManager?.removeUpdates(locationListener)
         } catch (_: Throwable) {
         }
+        try {
+            if (telephonyListenerRegistered) {
+                @Suppress("DEPRECATION")
+                telephonyManager?.listen(telephonyListener, PhoneStateListener.LISTEN_NONE)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "telephony state listener unregister failed", t)
+        }
+        telephonyListenerRegistered = false
         try {
             if (Build.VERSION.SDK_INT >= 30) {
                 locationManager?.removeNmeaListener(nmeaListener)
@@ -840,6 +908,7 @@ class MainActivity : Activity() {
             report.put("sim", JSONObject().apply {
                 put("verdict", v.name)
                 put("data", text)
+                put("stability", telephonyStabilityText())
             })
         } catch (t: Throwable) {
             Log.w(TAG, "sim read failed", t)
