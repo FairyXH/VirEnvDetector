@@ -90,6 +90,8 @@ adb shell am start -n io.github.fairyxh.VirEnvDetector/.MainActivity
 
 - **开始检测**：按当前模块配置实时检测并上报
 - **随机模拟**：一键调用 `/api/debug/random-env` 生成全套随机虚拟环境并启用，随后自动开始检测（推荐用于验证全链路）
+- **服务端测试（可选）**：在本地检测基础上上传随机 Bluetooth/WiFi/Cell 数据，等待服务端 ACK，并与检测器从模块实际读取的数据做条目存在性对比；不影响本地检测能力
+- 服务端 URL、Token、Device ID、最近测试状态和结果会保存在检测器私有设置中
 - **结束**：停止刷新与上报，保留最后一次快照
 
 ---

@@ -84,6 +84,11 @@ class MainActivity : Activity() {
         /** 上次检测是否运行中（进程被杀后重开自动恢复）。 */
         private const val PREFS_NAME = "vir_env_detector"
         private const val KEY_WAS_RUNNING = "was_running"
+        private const val KEY_REMOTE_URL = "remote_url"
+        private const val KEY_REMOTE_TOKEN = "remote_token"
+        private const val KEY_REMOTE_DEVICE = "remote_device"
+        private const val KEY_REMOTE_RESULT = "remote_result"
+        private const val KEY_REMOTE_STATE = "remote_state"
         private val REQUIRED_PERMS = buildList {
             add(Manifest.permission.ACCESS_FINE_LOCATION)
             add(Manifest.permission.ACCESS_COARSE_LOCATION)
@@ -134,6 +139,9 @@ class MainActivity : Activity() {
     private var remoteSequence = 0
     private val remoteTestRunning = AtomicBoolean(false)
     private val remoteAuthenticated = AtomicBoolean(false)
+    private val remoteAckedTypes = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val remoteAckedSequences = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val remoteUploadExpected = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
     private val running = AtomicBoolean(false)
     private val pendingRandom = AtomicBoolean(false)
     private val refreshExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
@@ -206,7 +214,11 @@ class MainActivity : Activity() {
     @Volatile
     private var lastCellText: String = "无基站（等待读取）"
     @Volatile
+    private var lastCellEntries: JSONArray? = null
+    @Volatile
     private var lastWifiText: String = "无扫描结果"
+    @Volatile
+    private var lastWifiNetworks: JSONArray? = null
     @Volatile
     private var lastSimText: String = "无 SIM 数据（等待读取）"
     @Volatile
@@ -461,43 +473,26 @@ class MainActivity : Activity() {
         }
         root.addView(container, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
 
-        val remoteTitle = TextView(this).apply {
-            text = "远程环境数据验证"
-            textSize = 28f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.parseColor("#111111"))
-            setPadding(0, 0, 0, dp(4))
-        }
-        container.addView(remoteTitle)
-        val remoteSubtitle = TextView(this).apply {
-            text = "连接通用环境服务，验证客户端认证、数据上传与 BLE RAW 链路。"
-            textSize = 13f
-            setTextColor(Color.parseColor("#666666"))
-            setPadding(0, 0, 0, dp(8))
-        }
-        container.addView(remoteSubtitle)
-
-        remoteUrlInput = edit(container, "服务端 WebSocket URL，例如 ws://10.0.0.111:8000/ws")
-        remoteTokenInput = edit(container, "Device Token")
-        remoteDeviceInput = edit(container, "Device ID")
-        val remoteButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val remoteStart = Button(this).apply { text = "开始远程上传测试" }
-        val remoteStop = Button(this).apply { text = "停止" }
-        remoteButtons.addView(remoteStart, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        remoteButtons.addView(remoteStop, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        container.addView(remoteButtons)
-        remoteStatus = TextView(this).apply { text = "未开始"; textSize = 13f }
-        remoteResult = TextView(this).apply { text = "上传/模拟/RAW 结果将在此显示"; textSize = 12f; typeface = Typeface.MONOSPACE }
-        container.addView(remoteStatus)
-        container.addView(remoteResult)
-        remoteStart.setOnClickListener { startRemoteUploadTest() }
-        remoteStop.setOnClickListener { stopRemoteUploadTest() }
         rootView = TextView(this).apply {
             text = "Root: 检测中…"
             textSize = 13f
             setTextColor(Color.parseColor("#666666"))
         }
         container.addView(rootView)
+        val title = TextView(this).apply {
+            text = "虚拟环境兼容性测试器"
+            textSize = 28f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#111111"))
+            setPadding(0, dp(8), 0, dp(4))
+        }
+        container.addView(title, 0)
+        val subtitle = TextView(this).apply {
+            text = "本地环境检测为主，服务端数据验证为可选扩展。"
+            textSize = 13f
+            setTextColor(Color.parseColor("#666666"))
+        }
+        container.addView(subtitle, 1)
         val hint = TextView(this).apply {
             text = "普通 App 视角读取环境 + 调用模块 API 比较期望配置。模块可能被 HideMyAppList 隐藏，建议授予 Root 以直接验证模块存在（读 LSPosed scope 与模块持久化配置）。随机模拟会覆盖现有配置，请做好备份。"
             textSize = 13f
@@ -528,6 +523,43 @@ class MainActivity : Activity() {
             onStopDetect()
         }
         exportButton.setOnClickListener { onExportReport() }
+
+        val remoteTitle = TextView(this).apply {
+            text = "服务端测试（可选）"
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, dp(16), 0, dp(4))
+        }
+        container.addView(remoteTitle)
+        val remoteSubtitle = TextView(this).apply {
+            text = "在本地检测基础上，可选上传随机环境数据，并将模块实际读取结果与已上报数据对比。"
+            textSize = 13f
+            setTextColor(Color.parseColor("#666666"))
+        }
+        container.addView(remoteSubtitle)
+        remoteUrlInput = edit(container, "服务端 WebSocket URL，例如 ws://10.0.0.111:8000/ws")
+        remoteTokenInput = edit(container, "Device Token")
+        remoteDeviceInput = edit(container, "Device ID")
+        val remoteButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val remoteStart = Button(this).apply { text = "开始远程测试" }
+        val remoteStop = Button(this).apply { text = "停止远程测试" }
+        remoteButtons.addView(remoteStart, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        remoteButtons.addView(remoteStop, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        container.addView(remoteButtons)
+        remoteStatus = TextView(this).apply { text = "未启用服务端测试"; textSize = 13f }
+        remoteResult = TextView(this).apply { text = "服务端测试结果将在本地测试数据下方显示"; textSize = 12f; typeface = Typeface.MONOSPACE }
+        container.addView(remoteStatus)
+        container.addView(remoteResult)
+        remoteStart.setOnClickListener { startRemoteUploadTest() }
+        remoteStop.setOnClickListener { stopRemoteUploadTest() }
+
+        // 服务端测试信息持久化：仅保存用户输入和最近结果，不保存临时 WebSocket。
+        val saved = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        remoteUrlInput.setText(saved.getString(KEY_REMOTE_URL, "") ?: "")
+        remoteTokenInput.setText(saved.getString(KEY_REMOTE_TOKEN, "") ?: "")
+        remoteDeviceInput.setText(saved.getString(KEY_REMOTE_DEVICE, "") ?: "")
+        remoteResult.text = saved.getString(KEY_REMOTE_RESULT, remoteResult.text.toString())
+        remoteStatus.text = saved.getString(KEY_REMOTE_STATE, "未启用服务端测试") ?: "未启用服务端测试"
 
         val loc = section(container, "位置")
         locationView = loc.first
@@ -613,7 +645,15 @@ class MainActivity : Activity() {
             return
         }
         stopRemoteUploadTest()
-        remoteSequence = 0
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(KEY_REMOTE_URL, remoteUrlInput.text.toString().trim())
+            .putString(KEY_REMOTE_TOKEN, remoteTokenInput.text.toString().trim())
+            .putString(KEY_REMOTE_DEVICE, remoteDeviceInput.text.toString().trim())
+            .apply()
+        remoteSequence = System.currentTimeMillis().toInt()
+        remoteAckedTypes.clear()
+        remoteAckedSequences.clear()
+        remoteUploadExpected.clear()
         remoteTestRunning.set(true)
         remoteAuthenticated.set(false)
         val request = Request.Builder().url(url).build()
@@ -630,16 +670,86 @@ class MainActivity : Activity() {
                 when (msg.optString("type")) {
                     "auth_result" -> {
                         remoteAuthenticated.set(msg.optBoolean("success"))
-                        runOnUiThread { remoteStatus.text = if (msg.optBoolean("success")) "认证成功，持续上传中" else "认证失败" }
+                        runOnUiThread {
+                            remoteStatus.text = if (msg.optBoolean("success")) "认证成功，随机数据上传中" else "认证失败"
+                            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                                .putString(KEY_REMOTE_STATE, remoteStatus.text.toString()).apply()
+                        }
                     }
-                    "data_result" -> runOnUiThread { remoteResult.text = "服务端接收：PASS type=${msg.optString("data_type")} sequence=${msg.optInt("sequence")}\n模拟上传：PASS\nBLE RAW：PASS（完整 raw/rawHex）" }
-                    "error" -> runOnUiThread { remoteResult.text = "服务端拒绝：${msg.optString("code")} ${msg.optString("message")}" }
+                    "data_result" -> {
+                        val type = msg.optString("data_type")
+                        val sequence = msg.optInt("sequence", -1)
+                        remoteAckedTypes += type
+                        remoteAckedSequences[type] = sequence
+                        val result = buildRemoteComparisonResult()
+                        runOnUiThread {
+                            remoteResult.text = result
+                            remoteStatus.text = "服务端测试进行中"
+                            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                                .putString(KEY_REMOTE_RESULT, result)
+                                .putString(KEY_REMOTE_STATE, remoteStatus.text.toString())
+                                .apply()
+                        }
+                    }
+                    "error" -> {
+                        val result = "服务端测试：FAIL\n服务端拒绝：${msg.optString("code")} ${msg.optString("message")}"
+                        runOnUiThread {
+                            remoteResult.text = result
+                            remoteStatus.text = "服务端测试失败"
+                            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                                .putString(KEY_REMOTE_RESULT, result)
+                                .putString(KEY_REMOTE_STATE, remoteStatus.text.toString())
+                                .apply()
+                        }
+                    }
                 }
             }
-            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { remoteAuthenticated.set(false); remoteTestRunning.set(false); runOnUiThread { remoteStatus.text = "连接失败：${t.message}" } }
-            override fun onClosed(ws: WebSocket, code: Int, reason: String) { remoteAuthenticated.set(false); remoteTestRunning.set(false); runOnUiThread { remoteStatus.text = "已断开：$code $reason" } }
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                remoteAuthenticated.set(false)
+                remoteTestRunning.set(false)
+                runOnUiThread {
+                    remoteStatus.text = "连接失败：${t.message}"
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_REMOTE_STATE, remoteStatus.text.toString()).apply()
+                }
+            }
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+                remoteAuthenticated.set(false)
+                remoteTestRunning.set(false)
+                runOnUiThread {
+                    remoteStatus.text = "已断开：$code $reason"
+                    getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_REMOTE_STATE, remoteStatus.text.toString()).apply()
+                }
+            }
         })
         refreshExecutor.execute { remoteUploadLoop() }
+    }
+
+    private fun buildRemoteComparisonResult(): String {
+        val expectedTypes = remoteUploadExpected.keys.toSet()
+        val ackTypes = remoteAckedTypes.toSet()
+        val uploadedPresent = expectedTypes.isNotEmpty() && expectedTypes.all { it in ackTypes }
+        val wifiExpected = remoteUploadExpected["wifi"]?.optJSONArray("networks")?.optJSONObject(0)?.optString("ssid", "") ?: ""
+        val cellExpected = remoteUploadExpected["cell"]?.optJSONArray("entries")?.optJSONObject(0)?.optString("ci", "") ?: ""
+        val bleExpected = remoteUploadExpected["bluetooth"]?.optJSONArray("devices")?.optJSONObject(0)
+        val bleAddress = bleExpected?.optString("address", "") ?: ""
+        val bleRaw = bleExpected?.optString("raw", "") ?: ""
+        val localWifiPass = wifiExpected.isNotEmpty() && (lastWifiNetworks?.toString()?.contains(wifiExpected) == true || lastWifiText.contains(wifiExpected))
+        val localCellPass = cellExpected.isNotEmpty() && (lastCellEntries?.toString()?.contains(cellExpected) == true || lastCellText.contains(cellExpected))
+        val localBlePass = synchronized(bleFound) {
+            (bleAddress.isNotEmpty() && bleFound.containsKey(bleAddress)) ||
+                (bleRaw.isNotEmpty() && bleRaw.any { entry -> entry.toString().contains(bleRaw) })
+        }
+        val moduleTypesPass = localWifiPass && localCellPass && localBlePass
+        return buildString {
+            append("服务端测试：").append(if (uploadedPresent) "PASS" else "等待/未通过").append('\n')
+            append("随机上传数据存在：").append(if (uploadedPresent) "PASS" else "等待").append('\n')
+            append("模块数据对比：").append(if (moduleTypesPass) "PASS" else "等待/未通过").append('\n')
+            append("  WiFi：").append(if (localWifiPass) "PASS" else "未发现上报 SSID").append('\n')
+            append("  Cell：").append(if (localCellPass) "PASS" else "未发现上报 CI").append('\n')
+            append("  BLE：").append(if (localBlePass) "PASS" else "未发现上报设备/RAW").append('\n')
+            append("服务端 ACK：").append(ackTypes.sorted().joinToString(", ").ifEmpty { "无" }).append('\n')
+            append("序号：").append(remoteAckedSequences.entries.joinToString { "${it.key}=${it.value}" }.ifEmpty { "无" })
+        }
     }
 
     private fun remoteUploadLoop() {
@@ -657,6 +767,9 @@ class MainActivity : Activity() {
                     put("raw", android.util.Base64.encodeToString(ByteArray(rawHex.length / 2) { i -> rawHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }, android.util.Base64.NO_WRAP))
                 })
             )}
+            remoteUploadExpected["bluetooth"] = JSONObject(data.toString())
+            remoteUploadExpected["wifi"] = JSONObject().put("networks", JSONArray().put(JSONObject().put("ssid", "Detector-WiFi-$seq").put("rssi", -50)))
+            remoteUploadExpected["cell"] = JSONObject().put("entries", JSONArray().put(JSONObject().put("type", "LTE").put("ci", seq)))
             val payload = JSONObject().apply { put("type", "environment_data"); put("version", 1); put("device_id", remoteDeviceInput.text.toString().trim()); put("data_type", "bluetooth"); put("timestamp", System.currentTimeMillis()); put("sequence", seq); put("data", data) }
             remoteSocket?.send(payload.toString())
             listOf("wifi" to JSONObject().put("networks", JSONArray().put(JSONObject().put("ssid", "Detector-WiFi-$seq").put("rssi", -50))), "cell" to JSONObject().put("entries", JSONArray().put(JSONObject().put("type", "LTE").put("ci", seq)))).forEach { (type, value) ->
@@ -668,8 +781,14 @@ class MainActivity : Activity() {
 
     private fun stopRemoteUploadTest() {
         remoteTestRunning.set(false)
+        remoteAuthenticated.set(false)
         remoteSocket?.close(1000, "detector stop")
         remoteSocket = null
+        val summary = buildRemoteComparisonResult()
+        if (::remoteResult.isInitialized) {
+            remoteResult.text = summary
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_REMOTE_RESULT, summary).apply()
+        }
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
@@ -974,6 +1093,7 @@ class MainActivity : Activity() {
         try {
             val text = formatCell()
             lastCellText = text
+            lastCellEntries = parseCellEntries()
             val v = settleVerdict(judgeCell())
             sb.append("cell: ").append(v.name).append(" | ").append(text).append('\n')
             runOnUiThread {
@@ -1008,6 +1128,7 @@ class MainActivity : Activity() {
         try {
             val text = formatWifi()
             lastWifiText = text
+            lastWifiNetworks = parseWifiNetworks()
             val v = settleVerdict(judgeWifi())
             sb.append("wifi: ").append(v.name).append(" | ").append(text).append('\n')
             runOnUiThread {
@@ -1071,6 +1192,11 @@ class MainActivity : Activity() {
         renderPlayback(report)
         report.put("hookObserve", hookObserveJson ?: JSONObject())
         latestReport = report
+        if (remoteTestRunning.get()) {
+            val remoteSummary = buildRemoteComparisonResult()
+            runOnUiThread { remoteResult.text = remoteSummary }
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_REMOTE_RESULT, remoteSummary).apply()
+        }
         Log.i(TAG, sb.toString().trim())
         // 上报报告到模块 ApiServer
         try {
@@ -1965,6 +2091,36 @@ class MainActivity : Activity() {
         if (classic.isNotEmpty()) sb.append("\n[经典] ").append(classic.take(10).joinToString("\n[经典] "))
         lastBtIdentityText = sb.toString()
         return sb.toString().trim().ifEmpty { "无 BLE 结果（等待扫描回调）" }
+    }
+
+    private fun parseCellEntries(): JSONArray {
+        val tm = telephonyManager ?: return JSONArray()
+        val result = JSONArray()
+        runCatching {
+            (tm.allCellInfo ?: emptyList()).forEach { info ->
+                val item = JSONObject().put("class", info.javaClass.simpleName)
+                when (info) {
+                    is CellInfoLte -> item.put("ci", info.cellIdentity.ci)
+                    is CellInfoNr -> item.put("nci", runCatching {
+                        info.cellIdentity.javaClass.getMethod("getNci").invoke(info.cellIdentity)
+                    }.getOrDefault(-1L))
+                    is CellInfoGsm -> item.put("cid", info.cellIdentity.cid)
+                    is CellInfoWcdma -> item.put("cid", info.cellIdentity.cid)
+                }
+                result.put(item)
+            }
+        }
+        return result
+    }
+
+    private fun parseWifiNetworks(): JSONArray {
+        val result = JSONArray()
+        runCatching {
+            (wifiManager?.scanResults ?: emptyList()).forEach { scan ->
+                result.put(JSONObject().put("ssid", scan.SSID).put("bssid", scan.BSSID).put("rssi", scan.level))
+            }
+        }
+        return result
     }
 
     private fun formatWifi(): String {
