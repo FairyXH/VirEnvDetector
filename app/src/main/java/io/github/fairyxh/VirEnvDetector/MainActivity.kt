@@ -206,6 +206,8 @@ class MainActivity : Activity() {
     private var lastBtIdentityText = ""
     private val sensorRaw = ConcurrentHashMap<Int, String>()
     private val bleFound = LinkedHashMap<String, String>()
+    /** BLE 广播 RAW 证据：address -> 完整 ScanRecord 字段，不只显示前 16 字节。 */
+    private val bleRaw = LinkedHashMap<String, JSONObject>()
     /** 经典发现（ACTION_FOUND）收集结果：address -> "name address rssi class" */
     private val classicFound = LinkedHashMap<String, String>()
     private val classicReceiver = object : BroadcastReceiver() {
@@ -318,13 +320,43 @@ class MainActivity : Activity() {
     private val bleScanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
-            val name = result.scanRecord?.deviceName ?: device.name ?: "(no name)"
-            val rawHex = result.scanRecord?.bytes?.take(16)?.joinToString("") { "%02X".format(it) }
-            val line = "$name ${device.address} ${result.rssi}dBm" + (if (!rawHex.isNullOrEmpty()) " raw=$rawHex" else "")
+            val record = result.scanRecord
+            val name = record?.deviceName ?: device.name ?: "(no name)"
+            val rawHex = record?.bytes?.joinToString("") { "%02X".format(it) } ?: ""
+            val line = "$name ${device.address} ${result.rssi}dBm" + (if (rawHex.isNotEmpty()) " raw=${rawHex.take(32)}${if (rawHex.length > 32) "…" else ""}" else "")
+            val rawEvidence = JSONObject().apply {
+                put("address", device.address)
+                put("name", name)
+                put("rssi", result.rssi)
+                put("txPower", result.txPower)
+                put("timestampNanos", result.timestampNanos)
+                put("callbackType", callbackType)
+                put("rawHex", rawHex)
+                put("rawLength", record?.bytes?.size ?: 0)
+                record?.manufacturerSpecificData?.let { map ->
+                    val manufacturers = JSONObject()
+                    for (i in 0 until map.size()) {
+                        manufacturers.put(map.keyAt(i).toString(), map.valueAt(i).toHex())
+                    }
+                    put("manufacturerData", manufacturers)
+                }
+                record?.serviceData?.let { map ->
+                    val services = JSONObject()
+                    map.forEach { (uuid, bytes) -> services.put(uuid.toString(), bytes.toHex()) }
+                    put("serviceData", services)
+                }
+                record?.serviceUuids?.let { uuids ->
+                    put("serviceUuids", org.json.JSONArray(uuids.map { it.toString() }))
+                }
+            }
             synchronized(bleFound) {
                 bleFound[device.address] = line
+                bleRaw[device.address] = rawEvidence
                 while (bleFound.size > BLE_RESULTS_LIMIT) {
-                    bleFound.keys.firstOrNull()?.let(bleFound::remove)
+                    bleFound.keys.firstOrNull()?.let {
+                        bleFound.remove(it)
+                        bleRaw.remove(it)
+                    }
                 }
             }
             onRealtimeBle()
@@ -618,7 +650,7 @@ class MainActivity : Activity() {
         bleScanner = BluetoothAdapter.getDefaultAdapter()?.bluetoothLeScanner
 
         sensorRaw.clear()
-        synchronized(bleFound) { bleFound.clear() }
+        synchronized(bleFound) { bleFound.clear(); bleRaw.clear() }
         lastStepCount = -1L
         detectorStartedAtMs = SystemClock.elapsedRealtime()
         lastGnssStatusAtMs = 0L
@@ -844,6 +876,9 @@ class MainActivity : Activity() {
             report.put("ble", JSONObject().apply {
                 put("verdict", v.name)
                 put("data", text)
+                put("rawEvidence", synchronized(bleFound) {
+                    org.json.JSONArray(bleRaw.values.map { JSONObject(it.toString()) })
+                })
             })
         } catch (t: Throwable) {
             Log.w(TAG, "ble read failed", t)
@@ -1168,6 +1203,7 @@ class MainActivity : Activity() {
         val devices = data.optJSONArray("devices") ?: return Verdict.FAIL
         if (devices.length() == 0) return Verdict.FAIL
         val found: Set<String> = synchronized(bleFound) { bleFound.keys.toSet() }
+        val rawEvidence: Map<String, JSONObject> = synchronized(bleFound) { bleRaw.toMap() }
         val classic: Set<String> = synchronized(bleFound) { classicFound.keys.toSet() }
         var scanHit = false
         for (i in 0 until devices.length()) {
@@ -1177,6 +1213,26 @@ class MainActivity : Activity() {
             val mode = d.optString("mode", "ble").lowercase()
             if (found.contains(address)) {
                 scanHit = true
+                val expectedRaw = d.optString("raw", "")
+                val evidence = rawEvidence[address]
+                if (expectedRaw.isNotBlank() && evidence != null) {
+                    val expectedHex = expectedRaw.uppercase().replace("[^0-9A-F]".toRegex(), "")
+                    val expectedBase64Hex = runCatching {
+                        android.util.Base64.decode(expectedRaw, android.util.Base64.DEFAULT).toHex()
+                    }.getOrDefault("")
+                    val actualHex = evidence.optString("rawHex", "").uppercase()
+                    if (expectedHex.isNotBlank() && actualHex != expectedHex &&
+                        expectedBase64Hex.isNotBlank() && actualHex != expectedBase64Hex
+                    ) return Verdict.FAIL
+                }
+                d.optString("manufacturerData", "").takeIf(String::isNotBlank)?.let { expected ->
+                    val actual = evidence?.optJSONObject("manufacturerData")?.toString().orEmpty()
+                    if (!actual.contains(expected, ignoreCase = true)) return Verdict.FAIL
+                }
+                d.optString("serviceData", "").takeIf(String::isNotBlank)?.let { expected ->
+                    val actual = evidence?.optJSONObject("serviceData")?.toString().orEmpty()
+                    if (!actual.contains(expected, ignoreCase = true)) return Verdict.FAIL
+                }
                 break
             }
             if ((mode == "classic" || mode == "dual") && classic.contains(address)) {
@@ -1487,7 +1543,7 @@ class MainActivity : Activity() {
         lastStepCount = -1L
         lastGnssStatus = null
         sensorRaw.clear()
-        synchronized(bleFound) { bleFound.clear() }
+        synchronized(bleFound) { bleFound.clear(); bleRaw.clear() }
         expectEnv = null
         expectLocation = null
         expectRoute = null
@@ -1751,8 +1807,11 @@ class MainActivity : Activity() {
         return sb.toString().trim()
     }
 
+    private fun ByteArray.toHex(): String = joinToString("") { "%02X".format(it) }
+
     private fun formatBle(): String {
         val found: List<String> = synchronized(bleFound) { bleFound.values.toList() }
+        val raw: List<JSONObject> = synchronized(bleFound) { bleRaw.values.toList() }
         val classic: List<String> = synchronized(bleFound) { classicFound.values.toList() }
         val sb = StringBuilder()
         // 蓝牙适配器身份：MAC/名称（虚拟化时由 system_server BluetoothManagerService 拦截）
@@ -1767,6 +1826,14 @@ class MainActivity : Activity() {
             sb.append("适配器读取失败: ").append(t.message).append('\n')
         }
         if (found.isNotEmpty()) sb.append(found.take(10).joinToString("\n"))
+        if (raw.isNotEmpty()) {
+            val rawSummary = raw.take(5).joinToString("\n") { item ->
+                "RAW ${item.optString("address")} len=${item.optInt("rawLength", 0)} " +
+                    "mfg=${item.optJSONObject("manufacturerData")?.length() ?: 0} " +
+                    "svc=${item.optJSONObject("serviceData")?.length() ?: 0}"
+            }
+            sb.append("\n[RAW] ").append(rawSummary.replace("\n", "\n[RAW] "))
+        }
         if (classic.isNotEmpty()) sb.append("\n[经典] ").append(classic.take(10).joinToString("\n[经典] "))
         lastBtIdentityText = sb.toString()
         return sb.toString().trim().ifEmpty { "无 BLE 结果（等待扫描回调）" }
