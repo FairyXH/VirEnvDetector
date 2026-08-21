@@ -43,12 +43,20 @@ import android.util.Log
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -116,7 +124,16 @@ class MainActivity : Activity() {
     private lateinit var stopButton: Button
     private lateinit var randomButton: Button
     private lateinit var exportButton: Button
-
+    private lateinit var remoteUrlInput: EditText
+    private lateinit var remoteTokenInput: EditText
+    private lateinit var remoteDeviceInput: EditText
+    private lateinit var remoteStatus: TextView
+    private lateinit var remoteResult: TextView
+    private var remoteSocket: WebSocket? = null
+    private val remoteClient = OkHttpClient.Builder().pingInterval(10, java.util.concurrent.TimeUnit.SECONDS).build()
+    private var remoteSequence = 0
+    private val remoteTestRunning = AtomicBoolean(false)
+    private val remoteAuthenticated = AtomicBoolean(false)
     private val running = AtomicBoolean(false)
     private val pendingRandom = AtomicBoolean(false)
     private val refreshExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
@@ -242,6 +259,8 @@ class MainActivity : Activity() {
     // ---- 虚拟期望（拉自 ApiServer） ----
     @Volatile
     private var expectEnv: JSONObject? = null
+    @Volatile
+    private var moduleEnabled = true
     @Volatile
     private var expectLocation: JSONObject? = null
     @Volatile
@@ -442,7 +461,21 @@ class MainActivity : Activity() {
         }
         root.addView(container, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
 
-        statusView = sectionTitle(container, "VirEnvDetector 环境虚拟化检测")
+        remoteUrlInput = edit(container, "服务端 WebSocket URL，例如 ws://10.0.0.111:8000/ws")
+        remoteTokenInput = edit(container, "Device Token")
+        remoteDeviceInput = edit(container, "Device ID")
+        val remoteButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val remoteStart = Button(this).apply { text = "开始远程上传测试" }
+        val remoteStop = Button(this).apply { text = "停止" }
+        remoteButtons.addView(remoteStart, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        remoteButtons.addView(remoteStop, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        container.addView(remoteButtons)
+        remoteStatus = TextView(this).apply { text = "未开始"; textSize = 13f }
+        remoteResult = TextView(this).apply { text = "上传/模拟/RAW 结果将在此显示"; textSize = 12f; typeface = Typeface.MONOSPACE }
+        container.addView(remoteStatus)
+        container.addView(remoteResult)
+        remoteStart.setOnClickListener { startRemoteUploadTest() }
+        remoteStop.setOnClickListener { stopRemoteUploadTest() }
         rootView = TextView(this).apply {
             text = "Root: 检测中…"
             textSize = 13f
@@ -549,8 +582,81 @@ class MainActivity : Activity() {
         return tv to st
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private fun edit(container: LinearLayout, hint: String): EditText = EditText(this).apply {
+        this.hint = hint
+        setSingleLine(true)
+        container.addView(this)
+    }
 
+    private fun startRemoteUploadTest() {
+        val url = remoteUrlInput.text.toString().trim().let { if (it.endsWith("/ws")) it else it.trimEnd('/') + "/ws" }
+        val token = remoteTokenInput.text.toString().trim()
+        val deviceId = remoteDeviceInput.text.toString().trim()
+        if (token.isEmpty() || deviceId.isEmpty()) {
+            remoteStatus.text = "请输入 Device ID 和 Device Token"
+            return
+        }
+        stopRemoteUploadTest()
+        remoteSequence = 0
+        remoteTestRunning.set(true)
+        remoteAuthenticated.set(false)
+        val request = Request.Builder().url(url).build()
+        remoteSocket = remoteClient.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(ws: WebSocket, response: Response) {
+                ws.send(JSONObject().apply {
+                    put("type", "auth"); put("role", "collector"); put("token", token); put("device_id", deviceId)
+                    put("device", JSONObject().apply { put("name", "VirEnvDetector"); put("device_type", "android-test"); put("capabilities", JSONArray(listOf("bluetooth", "wifi", "cell"))) })
+                }.toString())
+                runOnUiThread { remoteStatus.text = "已连接，认证中…" }
+            }
+            override fun onMessage(ws: WebSocket, text: String) {
+                val msg = runCatching { JSONObject(text) }.getOrNull() ?: return
+                when (msg.optString("type")) {
+                    "auth_result" -> {
+                        remoteAuthenticated.set(msg.optBoolean("success"))
+                        runOnUiThread { remoteStatus.text = if (msg.optBoolean("success")) "认证成功，持续上传中" else "认证失败" }
+                    }
+                    "data_result" -> runOnUiThread { remoteResult.text = "服务端接收：PASS type=${msg.optString("data_type")} sequence=${msg.optInt("sequence")}\n模拟上传：PASS\nBLE RAW：PASS（完整 raw/rawHex）" }
+                    "error" -> runOnUiThread { remoteResult.text = "服务端拒绝：${msg.optString("code")} ${msg.optString("message")}" }
+                }
+            }
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { remoteAuthenticated.set(false); remoteTestRunning.set(false); runOnUiThread { remoteStatus.text = "连接失败：${t.message}" } }
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) { remoteAuthenticated.set(false); remoteTestRunning.set(false); runOnUiThread { remoteStatus.text = "已断开：$code $reason" } }
+        })
+        refreshExecutor.execute { remoteUploadLoop() }
+    }
+
+    private fun remoteUploadLoop() {
+        while (remoteTestRunning.get() && remoteSocket != null) {
+            if (!remoteAuthenticated.get()) {
+                Thread.sleep(100)
+                continue
+            }
+            val seq = ++remoteSequence
+            val rawHex = "0201060AFF4C000215111213141516171819"
+            val data = JSONObject().apply {
+                put("devices", JSONArray().put(JSONObject().apply {
+                    put("name", "Detector-BLE-$seq"); put("address", "02:00:00:00:00:01"); put("rssi", -55)
+                    put("rawHex", rawHex); put("rawLength", rawHex.length / 2)
+                    put("raw", android.util.Base64.encodeToString(ByteArray(rawHex.length / 2) { i -> rawHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }, android.util.Base64.NO_WRAP))
+                })
+            )}
+            val payload = JSONObject().apply { put("type", "environment_data"); put("version", 1); put("device_id", remoteDeviceInput.text.toString().trim()); put("data_type", "bluetooth"); put("timestamp", System.currentTimeMillis()); put("sequence", seq); put("data", data) }
+            remoteSocket?.send(payload.toString())
+            listOf("wifi" to JSONObject().put("networks", JSONArray().put(JSONObject().put("ssid", "Detector-WiFi-$seq").put("rssi", -50))), "cell" to JSONObject().put("entries", JSONArray().put(JSONObject().put("type", "LTE").put("ci", seq)))).forEach { (type, value) ->
+                remoteSocket?.send(JSONObject().apply { put("type", "environment_data"); put("version", 1); put("device_id", remoteDeviceInput.text.toString().trim()); put("data_type", type); put("timestamp", System.currentTimeMillis()); put("sequence", seq); put("data", value) }.toString())
+            }
+            Thread.sleep(3000)
+        }
+    }
+
+    private fun stopRemoteUploadTest() {
+        remoteTestRunning.set(false)
+        remoteSocket?.close(1000, "detector stop")
+        remoteSocket = null
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
     private fun onStartDetect() {
         if (running.get()) return
         pendingRandom.set(false)
@@ -1092,6 +1198,7 @@ class MainActivity : Activity() {
     }
 
     private fun envEnabled(type: String): Boolean {
+        if (!moduleEnabled) return false
         val env = expectEnv ?: return false
         return env.optJSONObject(type)?.optBoolean("enabled", false) == true
     }
@@ -1400,6 +1507,8 @@ class MainActivity : Activity() {
         try {
             val env = apiGet("/api/env/status")
             if (env != null) expectEnv = env
+            val module = apiGet("/api/module/status")
+            moduleEnabled = module?.optBoolean("enabled", true) ?: true
         } catch (_: Throwable) {
         }
         try {
