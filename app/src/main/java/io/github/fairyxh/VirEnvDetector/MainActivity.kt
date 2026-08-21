@@ -1221,9 +1221,12 @@ class MainActivity : Activity() {
                         android.util.Base64.decode(expectedRaw, android.util.Base64.DEFAULT).toHex()
                     }.getOrDefault("")
                     val actualHex = evidence.optString("rawHex", "").uppercase()
-                    if (expectedHex.isNotBlank() && actualHex != expectedHex &&
-                        expectedBase64Hex.isNotBlank() && actualHex != expectedBase64Hex
-                    ) return Verdict.FAIL
+                    val rawMatches = when {
+                        expectedHex.length >= 2 && expectedHex.length % 2 == 0 -> actualHex == expectedHex
+                        expectedBase64Hex.isNotBlank() -> actualHex == expectedBase64Hex
+                        else -> false
+                    }
+                    if (!rawMatches) return Verdict.FAIL
                 }
                 d.optString("manufacturerData", "").takeIf(String::isNotBlank)?.let { expected ->
                     val actual = evidence?.optJSONObject("manufacturerData")?.toString().orEmpty()
