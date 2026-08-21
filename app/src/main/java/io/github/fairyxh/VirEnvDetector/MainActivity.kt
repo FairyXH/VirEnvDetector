@@ -461,6 +461,22 @@ class MainActivity : Activity() {
         }
         root.addView(container, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
 
+        val remoteTitle = TextView(this).apply {
+            text = "远程环境数据验证"
+            textSize = 28f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#111111"))
+            setPadding(0, 0, 0, dp(4))
+        }
+        container.addView(remoteTitle)
+        val remoteSubtitle = TextView(this).apply {
+            text = "连接通用环境服务，验证客户端认证、数据上传与 BLE RAW 链路。"
+            textSize = 13f
+            setTextColor(Color.parseColor("#666666"))
+            setPadding(0, 0, 0, dp(8))
+        }
+        container.addView(remoteSubtitle)
+
         remoteUrlInput = edit(container, "服务端 WebSocket URL，例如 ws://10.0.0.111:8000/ws")
         remoteTokenInput = edit(container, "Device Token")
         remoteDeviceInput = edit(container, "Device ID")
