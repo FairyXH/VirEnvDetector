@@ -292,6 +292,10 @@ class MainActivity : Activity() {
     @Volatile
     private var moduleEnabled = true
     @Volatile
+    private var remoteSimulationMode = false
+    @Volatile
+    private var remoteSimulationUpdatedAt = 0L
+    @Volatile
     private var expectLocation: JSONObject? = null
     @Volatile
     private var expectRoute: JSONObject? = null
@@ -1573,7 +1577,47 @@ class MainActivity : Activity() {
         } else null
     }
 
+    private fun remoteContains(type: String): Boolean {
+        if (!remoteSimulationMode) return false
+        val actual = when (type) {
+            "wifi" -> lastWifiText
+            "cell" -> lastCellText
+            "ble" -> formatBle()
+            "sensor" -> formatSensor()
+            "gnss" -> formatGnss()
+            else -> ""
+        }
+        val expected = envData(type) ?: return false
+        val serialized = expected.toString()
+        return serialized.isNotBlank() && expected.keys().asSequence().all { key ->
+            val value = expected.opt(key)
+            value !is JSONArray || value.length() == 0 || actual.isNotBlank()
+        } && actual.isNotBlank() && (
+            actual.contains(serialized, ignoreCase = true) ||
+                expected.keys().asSequence().any { key ->
+                    val value = expected.optString(key, "")
+                    value.isNotBlank() && actual.contains(value, ignoreCase = true)
+                }
+            )
+    }
+
+    private fun remoteLocationContains(loc: Location?): Boolean {
+        if (!remoteSimulationMode || loc == null) return false
+        val expected = expectLocation ?: return false
+        if (!expected.optBoolean("enabled", false)) return false
+        val distance = FloatArray(1)
+        Location.distanceBetween(
+            expected.optDouble("latitude", Double.NaN),
+            expected.optDouble("longitude", Double.NaN),
+            loc.latitude,
+            loc.longitude,
+            distance,
+        )
+        return !distance[0].isNaN() && distance[0] <= 500f
+    }
+
     private fun judgeLocation(loc: Location?): Verdict {
+        if (remoteSimulationMode) return if (remoteLocationContains(loc)) Verdict.PASS else Verdict.FAIL
         val expected = expectLocation ?: return Verdict.NOT_ENABLED
         val enabled = expected.optBoolean("enabled", false)
         val mode = expected.optString("mode", "none")
@@ -1597,6 +1641,7 @@ class MainActivity : Activity() {
     }
 
     private fun judgeCell(): Verdict {
+        if (remoteSimulationMode) return if (remoteContains("cell")) Verdict.PASS else Verdict.FAIL
         val data = envData("cell") ?: return Verdict.NOT_ENABLED
         val entries = data.optJSONArray("entries") ?: return Verdict.FAIL
         if (entries.length() == 0) {
@@ -1669,6 +1714,7 @@ class MainActivity : Activity() {
     }
 
     private fun judgeBle(): Verdict {
+        if (remoteSimulationMode) return if (remoteContains("ble")) Verdict.PASS else Verdict.FAIL
         val data = envData("ble") ?: return Verdict.NOT_ENABLED
         val devices = data.optJSONArray("devices") ?: return Verdict.FAIL
         if (devices.length() == 0) return Verdict.FAIL
@@ -1724,6 +1770,7 @@ class MainActivity : Activity() {
     }
 
     private fun judgeWifi(): Verdict {
+        if (remoteSimulationMode) return if (remoteContains("wifi")) Verdict.PASS else Verdict.FAIL
         val data = envData("wifi") ?: return Verdict.NOT_ENABLED
         val networks = data.optJSONArray("networks") ?: return Verdict.FAIL
         if (networks.length() == 0) return Verdict.FAIL
@@ -1744,6 +1791,7 @@ class MainActivity : Activity() {
     }
 
     private fun judgeSensor(): Verdict {
+        if (remoteSimulationMode) return if (remoteContains("sensor")) Verdict.PASS else Verdict.FAIL
         val data = envData("sensor") ?: return Verdict.NOT_ENABLED
         val stepFreq = data.optInt("stepFrequency", 0)
         val hasEvents = data.optJSONArray("events")?.length() ?: 0
@@ -1752,6 +1800,7 @@ class MainActivity : Activity() {
     }
 
     private fun judgeGnss(): Verdict {
+        if (remoteSimulationMode) return if (remoteContains("gnss")) Verdict.PASS else Verdict.FAIL
         val data = envData("gnss") ?: return Verdict.NOT_ENABLED
         val expectSat = data.optInt("satelliteCount", 0)
         val expectUsed = data.optInt("usedInFix", 0)
@@ -1868,15 +1917,20 @@ class MainActivity : Activity() {
     /** 拉取期望配置（env/location/route/recording）并跟踪变更。 */
     private fun refreshExpectations() {
         try {
-            val env = apiGet("/api/env/status")
-            if (env != null) expectEnv = env
+            val remote = apiGet("/api/remote/status")
+            remoteSimulationMode = remote?.optBoolean("enabled", false) == true
+            remoteSimulationUpdatedAt = remote?.optLong("updatedAt", 0L) ?: 0L
+            if (remoteSimulationMode) {
+                remote?.optJSONObject("env")?.let { expectEnv = JSONObject(it.toString()) }
+                remote?.optJSONObject("location")?.let { expectLocation = JSONObject(it.toString()) }
+            } else {
+                val env = apiGet("/api/env/status")
+                if (env != null) expectEnv = env
+                val loc = apiGet("/api/location/status")
+                if (loc != null) expectLocation = loc
+            }
             val module = apiGet("/api/module/status")
             moduleEnabled = module?.optBoolean("enabled", true) ?: true
-        } catch (_: Throwable) {
-        }
-        try {
-            val loc = apiGet("/api/location/status")
-            if (loc != null) expectLocation = loc
         } catch (_: Throwable) {
         }
         try {
@@ -2018,7 +2072,11 @@ class MainActivity : Activity() {
                 it.text = "-"
                 it.setTextColor(gray)
             }
-            statusView.text = "持续采集中…（每秒刷新；开始按钮只判定）"
+            statusView.text = if (remoteSimulationMode) {
+                "远程环境模拟判定中…（按模块当前生效快照，包含即通过）"
+            } else {
+                "持续采集中…（每秒刷新；开始按钮只判定）"
+            }
         }
     }
 
