@@ -473,6 +473,13 @@ class MainActivity : Activity() {
         }
         root.addView(container, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
 
+        statusView = TextView(this).apply {
+            text = "未开始"
+            textSize = 14f
+            setTextColor(Color.parseColor("#666666"))
+        }
+        container.addView(statusView)
+
         rootView = TextView(this).apply {
             text = "Root: 检测中…"
             textSize = 13f
@@ -1002,12 +1009,16 @@ class MainActivity : Activity() {
     }
 
     private fun onStopDetect() {
-        if (!running.get()) return
-        running.set(false)
+        val wasRunning = running.getAndSet(false)
+        val hadRefresh = refreshFuture != null
+        if (!wasRunning && !hadRefresh) {
+            clearResults()
+            return
+        }
         refreshFuture?.cancel(false)
         refreshFuture = null
-        startButton.isEnabled = true
-        stopButton.isEnabled = false
+        if (::startButton.isInitialized) startButton.isEnabled = true
+        if (::stopButton.isInitialized) stopButton.isEnabled = false
         try {
             sensorManager?.unregisterListener(stepListener)
             sensorManager?.unregisterListener(rawSensorListener)
