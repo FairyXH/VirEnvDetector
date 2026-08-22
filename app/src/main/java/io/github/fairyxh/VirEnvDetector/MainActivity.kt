@@ -58,6 +58,8 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -150,6 +152,11 @@ class MainActivity : Activity() {
     private var remoteLastUploadSummary = "尚未上传数据"
     private val running = AtomicBoolean(false)
     private val pendingRandom = AtomicBoolean(false)
+    private val pendingJudge = AtomicBoolean(false)
+    private val judgeRequested = AtomicBoolean(false)
+    private val refreshLabels = mutableMapOf<String, TextView>()
+    @Volatile
+    private var lastRefreshText = "未刷新"
     private val refreshExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "ZVE-DetectorRefresh").apply { isDaemon = true }
     }
@@ -421,17 +428,11 @@ class MainActivity : Activity() {
         setContentView(buildUi())
         Log.i(TAG, "VirEnvDetector started pkg=${packageName} token=${if (apiToken.isEmpty()) "MISSING" else "loaded len=${apiToken.length} head=${apiToken.take(8)}"}")
         checkRootAsync()
-        // 自动恢复上次检测状态：进程被划掉/被杀后重开，无需手动重新点「开始」。
-        // 传感器/计步数据从系统层全局通道持续推送，这里只负责重新注册监听器继续展示。
+        // 打开检测器即开始采集；开始按钮只执行一次判定，不控制采集生命周期。
         try {
-            val wasRunning = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                .getBoolean(KEY_WAS_RUNNING, false)
-            if (wasRunning) {
-                Log.i(TAG, "auto-resume detector from saved running state")
-                onStartDetect()
-            }
+            if (hasPermissions()) doStart() else requestPermissions(REQUIRED_PERMS.toTypedArray(), 100)
         } catch (t: Throwable) {
-            Log.w(TAG, "auto-resume failed", t)
+            Log.w(TAG, "continuous capture start failed", t)
         }
     }
 
@@ -514,7 +515,7 @@ class MainActivity : Activity() {
         container.addView(hint)
 
         startButton = Button(this).apply { text = "开始检测" }
-        stopButton = Button(this).apply { text = "结束" ; isEnabled = false }
+        stopButton = Button(this).apply { text = "清除判定" ; isEnabled = true }
         randomButton = Button(this).apply { text = "随机模拟" }
         exportButton = Button(this).apply { text = "导出报告" }
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -525,16 +526,7 @@ class MainActivity : Activity() {
         container.addView(row)
         startButton.setOnClickListener { onStartDetect() }
         randomButton.setOnClickListener { onRandomSimulate() }
-        stopButton.setOnClickListener {
-            // 用户主动结束：清除自动恢复标记（区别于进程被划掉/杀死的 onDestroy）
-            try {
-                getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-                    .edit().putBoolean(KEY_WAS_RUNNING, false).apply()
-            } catch (t: Throwable) {
-                Log.w(TAG, "clear running state failed", t)
-            }
-            onStopDetect()
-        }
+        stopButton.setOnClickListener { clearResults() }
         exportButton.setOnClickListener { onExportReport() }
 
         val remoteTitle = TextView(this).apply {
@@ -631,6 +623,7 @@ class MainActivity : Activity() {
             textSize = 12f
             gravity = Gravity.END
         }
+        refreshLabels[label] = lbl
         head.addView(lbl, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         head.addView(st, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         container.addView(head)
@@ -928,18 +921,17 @@ class MainActivity : Activity() {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
     private fun onStartDetect() {
-        if (running.get()) return
         pendingRandom.set(false)
         if (!hasPermissions()) {
+            pendingJudge.set(true)
             requestPermissions(REQUIRED_PERMS.toTypedArray(), 100)
             return
         }
-        doStart()
+        refreshExecutor.execute { refreshAll(judgeNow = true) }
     }
 
     /** 随机模拟：调用模块调试 API 生成全套随机虚拟环境并启用，然后自动开始检测。 */
     private fun onRandomSimulate() {
-        if (running.get()) return
         pendingRandom.set(true)
         if (!hasPermissions()) {
             requestPermissions(REQUIRED_PERMS.toTypedArray(), 100)
@@ -994,6 +986,7 @@ class MainActivity : Activity() {
         if (requestCode == 100) {
             if (hasPermissions()) {
                 if (pendingRandom.get()) doRandomAndStart() else doStart()
+                if (pendingJudge.getAndSet(false)) refreshExecutor.execute { refreshAll(judgeNow = true) }
             } else {
                 statusView.text = "缺少权限，无法检测"
                 pendingRandom.set(false)
@@ -1014,9 +1007,8 @@ class MainActivity : Activity() {
         } catch (t: Throwable) {
             Log.w(TAG, "save running state failed", t)
         }
-        startButton.isEnabled = false
-        stopButton.isEnabled = true
-        statusView.text = "检测中…（每秒刷新 + 上报报告）"
+        startButton.isEnabled = true
+        statusView.text = "持续采集中…（每秒刷新；开始按钮只判定）"
 
         val ctx: Context = applicationContext
         locationManager = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
@@ -1183,7 +1175,7 @@ class MainActivity : Activity() {
             }
         } catch (_: Throwable) {
         }
-        // 结束按钮只结束本地检测；服务端 Collector 由其独立按钮控制。
+        // Activity 销毁时停止持续采集并清理资源；页面按钮不调用此方法。
         clearResults()
         refreshExecutor.execute {
             apiPost("/api/debug/observe/end", JSONObject())
@@ -1196,8 +1188,12 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun refreshAll() {
-        // 实时同步期望配置（失败保留上次，判 NOT_ENABLED）
+    private fun updateRefreshLabel(label: String) {
+        refreshLabels[label]?.text = "$label（最后刷新：$lastRefreshText）"
+    }
+
+    private fun refreshAll(judgeNow: Boolean = false) {
+        lastRefreshText = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
         refreshExpectations()
         try {
             val obs = apiGet("/api/debug/observe/snapshot")
@@ -1216,11 +1212,12 @@ class MainActivity : Activity() {
             val loc = readLastLocation()
             lastLocation = loc
             val text = formatLocation(loc)
-            val v = settleVerdict(judgeLocation(loc))
+            val v = if (judgeNow) settleVerdict(judgeLocation(loc)) else Verdict.UNKNOWN
             sb.append("location: ").append(v.name).append(" | ").append(text).append('\n')
             runOnUiThread {
                 locationView.text = text
-                renderVerdict(locationStatus, v)
+                updateRefreshLabel("位置")
+                if (judgeNow) renderVerdict(locationStatus, v)
             }
             report.put("location", JSONObject().apply {
                 put("verdict", v.name)
@@ -1233,11 +1230,12 @@ class MainActivity : Activity() {
             val text = formatCell()
             lastCellText = text
             lastCellEntries = parseCellEntries()
-            val v = settleVerdict(judgeCell())
+            val v = if (judgeNow) settleVerdict(judgeCell()) else Verdict.UNKNOWN
             sb.append("cell: ").append(v.name).append(" | ").append(text).append('\n')
             runOnUiThread {
                 cellView.text = text
-                renderVerdict(cellStatus, v)
+                updateRefreshLabel("基站")
+                if (judgeNow) renderVerdict(cellStatus, v)
             }
             report.put("cell", JSONObject().apply {
                 put("verdict", v.name)
@@ -1248,11 +1246,12 @@ class MainActivity : Activity() {
         }
         try {
             val text = formatBle()
-            val v = settleVerdict(judgeBle())
+            val v = if (judgeNow) settleVerdict(judgeBle()) else Verdict.UNKNOWN
             sb.append("ble: ").append(v.name).append(" | ").append(text).append('\n')
             runOnUiThread {
                 bleView.text = text
-                renderVerdict(bleStatus, v)
+                updateRefreshLabel("蓝牙 BLE")
+                if (judgeNow) renderVerdict(bleStatus, v)
             }
             report.put("ble", JSONObject().apply {
                 put("verdict", v.name)
@@ -1268,11 +1267,12 @@ class MainActivity : Activity() {
             val text = formatWifi()
             lastWifiText = text
             lastWifiNetworks = parseWifiNetworks()
-            val v = settleVerdict(judgeWifi())
+            val v = if (judgeNow) settleVerdict(judgeWifi()) else Verdict.UNKNOWN
             sb.append("wifi: ").append(v.name).append(" | ").append(text).append('\n')
             runOnUiThread {
                 wifiView.text = text
-                renderVerdict(wifiStatus, v)
+                updateRefreshLabel("WiFi")
+                if (judgeNow) renderVerdict(wifiStatus, v)
             }
             report.put("wifi", JSONObject().apply {
                 put("verdict", v.name)
@@ -1283,11 +1283,12 @@ class MainActivity : Activity() {
         }
         try {
             val text = formatSensor()
-            val v = settleVerdict(judgeSensor())
+            val v = if (judgeNow) settleVerdict(judgeSensor()) else Verdict.UNKNOWN
             sb.append("sensor: ").append(v.name).append(" | ").append(text).append('\n')
             runOnUiThread {
                 sensorView.text = text
-                renderVerdict(sensorStatus, v)
+                updateRefreshLabel("传感器")
+                if (judgeNow) renderVerdict(sensorStatus, v)
             }
             report.put("sensor", JSONObject().apply {
                 put("verdict", v.name)
@@ -1298,11 +1299,12 @@ class MainActivity : Activity() {
         }
         try {
             val text = formatGnss()
-            val v = settleVerdict(judgeGnss())
+            val v = if (judgeNow) settleVerdict(judgeGnss()) else Verdict.UNKNOWN
             sb.append("gnss: ").append(v.name).append(" | ").append(text).append('\n')
             runOnUiThread {
                 gnssView.text = text
-                renderVerdict(gnssStatus, v)
+                updateRefreshLabel("GNSS")
+                if (judgeNow) renderVerdict(gnssStatus, v)
             }
             report.put("gnss", JSONObject().apply {
                 put("verdict", v.name)
@@ -1314,11 +1316,12 @@ class MainActivity : Activity() {
         try {
             val text = formatSim()
             lastSimText = text
-            val v = settleVerdict(judgeSim())
+            val v = if (judgeNow) settleVerdict(judgeSim()) else Verdict.UNKNOWN
             sb.append("sim: ").append(v.name).append(" | ").append(text).append('\n')
             runOnUiThread {
                 simView.text = text
-                renderVerdict(simStatus, v)
+                updateRefreshLabel("SIM")
+                if (judgeNow) renderVerdict(simStatus, v)
             }
             report.put("sim", JSONObject().apply {
                 put("verdict", v.name)
