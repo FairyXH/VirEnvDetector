@@ -568,8 +568,9 @@ class MainActivity : Activity() {
         remoteUrlInput.setText(saved.getString(KEY_REMOTE_URL, "") ?: "")
         remoteTokenInput.setText(saved.getString(KEY_REMOTE_TOKEN, "") ?: "")
         remoteDeviceInput.setText(saved.getString(KEY_REMOTE_DEVICE, "") ?: "")
-        remoteResult.text = saved.getString(KEY_REMOTE_RESULT, remoteResult.text.toString())
-        remoteStatus.text = saved.getString(KEY_REMOTE_STATE, "未启用服务端测试") ?: "未启用服务端测试"
+        val savedRemoteResult = saved.getString(KEY_REMOTE_RESULT, remoteResult.text.toString()) ?: remoteResult.text.toString()
+        remoteResult.text = if (savedRemoteResult.isBlank()) "尚未运行远程测试" else "历史结果（重新点击开始远程测试后更新）\\n$savedRemoteResult"
+        remoteStatus.text = if (saved.getString(KEY_REMOTE_STATE, "").isNullOrBlank()) "未启用服务端测试" else "${saved.getString(KEY_REMOTE_STATE, "未启用服务端测试")}（历史状态）"
 
         val loc = section(container, "位置")
         locationView = loc.first
@@ -666,6 +667,7 @@ class MainActivity : Activity() {
         remoteAckAt.clear()
         remoteUploadExpected.clear()
         remoteExpectedHistory.clear()
+        remoteResult.text = "等待本轮服务端 ACK 和本机实读数据…"
         remoteTestRunning.set(true)
         remoteAuthenticated.set(false)
         val request = Request.Builder().url(url).build()
@@ -754,9 +756,13 @@ class MainActivity : Activity() {
         val cellMatched = (0 until (cellExpected?.length() ?: 0)).count { index ->
             val item = cellExpected?.optJSONObject(index) ?: return@count false
             val type = item.optString("type", "")
-            val identity = listOf("ci", "nci", "psc", "lac", "cid", "bid", "nid", "sid")
-                .firstNotNullOfOrNull { key -> item.optString(key, "").takeIf { it.isNotEmpty() } }
-            type.isNotEmpty() && identity != null && lastCellText.contains(type, ignoreCase = true) && lastCellText.contains(identity)
+            val identity = when (type) {
+                "NR" -> item.optString("nci", "")
+                "GSM", "WCDMA" -> item.optString("cid", "")
+                "CDMA" -> item.optString("sid", "")
+                else -> item.optString("ci", "")
+            }
+            type.isNotEmpty() && identity.isNotEmpty() && lastCellText.contains(type, ignoreCase = true) && lastCellText.contains("$identity")
         }
         val bleMatched = (0 until (bleExpected?.length() ?: 0)).count { index ->
             val item = bleExpected?.optJSONObject(index) ?: return@count false
@@ -833,9 +839,9 @@ class MainActivity : Activity() {
             listOf("LTE", "NR", "WCDMA", "GSM", "CDMA").forEachIndexed { index, type ->
                 cellEntries.put(JSONObject().apply {
                     put("type", type); put("mcc", 460); put("mnc", 11 + index)
-                    put("tac", 1000 + seq % 1000); put("ci", seq + index)
-                    put("nci", seq.toLong() + index); put("psc", 100 + index); put("lac", 200 + index)
-                    put("cid", seq + index); put("bid", seq + index); put("nid", 300 + index); put("sid", 400 + index)
+                    put("tac", 1000 + seq % 1000); put("ci", 100000 + seq % 100000)
+                    put("nci", 1000000L + (seq.toLong() % 60000000000L)); put("psc", 100 + index); put("lac", 200 + index)
+                    put("cid", 10000 + seq % 40000); put("bid", 1 + index); put("nid", 300 + index); put("sid", 400 + index)
                 })
             }
             val cell = JSONObject().put("entries", cellEntries)
@@ -1553,13 +1559,13 @@ class MainActivity : Activity() {
                 val expectedRaw = d.optString("raw", "")
                 val evidence = rawEvidence[address]
                 if (expectedRaw.isNotBlank() && evidence != null) {
-                    val expectedHex = expectedRaw.uppercase().replace("[^0-9A-F]".toRegex(), "")
+                    val expectedHex = expectedRaw.uppercase()
                     val expectedBase64Hex = runCatching {
                         android.util.Base64.decode(expectedRaw, android.util.Base64.DEFAULT).toHex()
                     }.getOrDefault("")
                     val actualHex = evidence.optString("rawHex", "").uppercase()
                     val rawMatches = when {
-                        expectedHex.length >= 2 && expectedHex.length % 2 == 0 -> actualHex == expectedHex
+                        expectedHex.matches("[0-9A-F]+".toRegex()) && expectedHex.length >= 2 && expectedHex.length % 2 == 0 -> actualHex == expectedHex
                         expectedBase64Hex.isNotBlank() -> actualHex == expectedBase64Hex
                         else -> false
                     }
@@ -2121,9 +2127,9 @@ class MainActivity : Activity() {
                     val id = info.cellIdentity
                     sb.append("CDMA lat=").append(id.latitude)
                         .append(" lon=").append(id.longitude)
-                    reflectCellInt(id, "getSid")?.let { if (it >= 0) sb.append(" sid=").append(it) }
-                    reflectCellInt(id, "getNid")?.let { if (it >= 0) sb.append(" nid=").append(it) }
-                    reflectCellInt(id, "getBid")?.let { if (it >= 0) sb.append(" bid=").append(it) }
+                    reflectCellInt(id, "getSystemId")?.let { if (it >= 0) sb.append(" sid=").append(it) }
+                    reflectCellInt(id, "getNetworkId")?.let { if (it >= 0) sb.append(" nid=").append(it) }
+                    reflectCellInt(id, "getBasestationId")?.let { if (it >= 0) sb.append(" bid=").append(it) }
                     sb.append('\n')
                 }
                 is CellInfoWcdma -> {
