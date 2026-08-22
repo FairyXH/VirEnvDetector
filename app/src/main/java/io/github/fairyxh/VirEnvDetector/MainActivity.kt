@@ -145,6 +145,9 @@ class MainActivity : Activity() {
     private val remoteAckAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val remoteUploadExpected = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
     private val remoteExpectedHistory = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedDeque<JSONObject>>()
+    private val remoteNextSequences = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    @Volatile
+    private var remoteLastUploadSummary = "尚未上传数据"
     private val running = AtomicBoolean(false)
     private val pendingRandom = AtomicBoolean(false)
     private val refreshExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
@@ -667,6 +670,8 @@ class MainActivity : Activity() {
         remoteAckAt.clear()
         remoteUploadExpected.clear()
         remoteExpectedHistory.clear()
+        remoteNextSequences.clear()
+        remoteLastUploadSummary = "尚未上传数据"
         remoteResult.text = "等待本轮服务端 ACK 和本机实读数据…"
         remoteTestRunning.set(true)
         remoteAuthenticated.set(false)
@@ -762,7 +767,18 @@ class MainActivity : Activity() {
                 "CDMA" -> item.optString("sid", "")
                 else -> item.optString("ci", "")
             }
-            type.isNotEmpty() && identity.isNotEmpty() && lastCellText.contains(type, ignoreCase = true) && lastCellText.contains("$identity")
+            if (identity.isEmpty()) return@count false
+            val localEntries = lastCellEntries
+            if (localEntries != null && localEntries.length() > 0) {
+                (0 until localEntries.length()).any { localIndex ->
+                    val local = localEntries.optJSONObject(localIndex) ?: return@any false
+                    val localIdentity = listOf("nci", "ci", "cid", "sid")
+                        .firstNotNullOfOrNull { key -> local.optString(key, "").takeIf { it.isNotEmpty() && it != "-1" } }
+                    localIdentity == identity
+                }
+            } else {
+                type.isNotEmpty() && lastCellText.contains(type, ignoreCase = true) && lastCellText.contains(identity)
+            }
         }
         val bleMatched = (0 until (bleExpected?.length() ?: 0)).count { index ->
             val item = bleExpected?.optJSONObject(index) ?: return@count false
@@ -785,6 +801,7 @@ class MainActivity : Activity() {
             append("实时监听：").append(if (remoteTestRunning.get()) "运行中" else "已停止").append('\n')
             append("远程认证：").append(if (remoteAuthenticated.get()) "PASS" else "未认证").append('\n')
             append("服务端测试：").append(if (uploadedPresent) "PASS" else "等待/未通过").append('\n')
+            append("最近上传：").append(remoteLastUploadSummary).append('\n')
             append("远程数据匹配：").append(if (moduleTypesPass) "PASS" else "等待/未通过").append('\n')
             append("模块数据对比：").append(if (moduleTypesPass) "PASS" else "等待/未通过").append('\n')
             append("  WiFi：").append(if (localWifiPass) "PASS" else "FAIL").append(" ($wifiMatched/$wifiTotal)").append('\n')
@@ -812,46 +829,64 @@ class MainActivity : Activity() {
                 Thread.sleep(100)
                 continue
             }
-            val seq = ++remoteSequence
+            val deviceId = remoteDeviceInput.text.toString().trim()
+            fun nextSequence(type: String): Int {
+                return remoteNextSequences.compute(type) { _, previous ->
+                    (previous ?: (System.currentTimeMillis() / 1000L).toInt()) + 1
+                } ?: 1
+            }
+            val bluetoothSequence = nextSequence("bluetooth")
+            val wifiSequence = nextSequence("wifi")
+            val cellSequence = nextSequence("cell")
+            val seq = bluetoothSequence
             val rawHex = "0201060AFF4C000215111213141516171819"
             val rawBytes = ByteArray(rawHex.length / 2) { i -> rawHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
             val raw = android.util.Base64.encodeToString(rawBytes, android.util.Base64.NO_WRAP)
             val bleDevices = JSONArray()
             repeat(5) { index ->
                 bleDevices.put(JSONObject().apply {
-                    put("name", "Detector-BLE-$seq-$index")
-                    put("address", String.format("02:00:00:%02X:%02X:%02X", seq and 0xff, index, (seq + index) and 0xff))
+                    val mode = when (index) { 0, 1 -> "ble"; 2, 3 -> "classic"; else -> "dual" }
+                    put("name", "Detector-BT-$bluetoothSequence-$index")
+                    put("address", String.format("02:00:%02X:%02X:%02X:%02X", bluetoothSequence and 0xff, index, (bluetoothSequence shr 8) and 0xff, (bluetoothSequence + index) and 0xff))
                     put("rssi", -45 - index * 5)
-                    put("raw", raw); put("rawHex", rawHex); put("rawLength", rawBytes.size)
+                    put("mode", mode)
+                    put("classicRssi", -50 - index * 4)
+                    put("classOfDevice", 2360324 + index)
+                    if (mode != "classic") put("raw", raw).put("rawHex", rawHex).put("rawLength", rawBytes.size)
                 })
             }
             val data = JSONObject().put("devices", bleDevices)
             val wifiNetworks = JSONArray()
             repeat(5) { index ->
                 wifiNetworks.put(JSONObject().apply {
-                    put("ssid", "Detector-WiFi-$seq-$index")
-                    put("bssid", String.format("AA:BB:%02X:%02X:%02X:%02X", seq and 0xff, index, (seq shr 8) and 0xff, (seq + index) and 0xff))
+                    put("ssid", "Detector-WiFi-$wifiSequence-$index")
+                    put("bssid", String.format("AA:BB:%02X:%02X:%02X:%02X", wifiSequence and 0xff, index, (wifiSequence shr 8) and 0xff, (wifiSequence + index) and 0xff))
                     put("rssi", -40 - index * 6); put("frequency", 2412 + index * 5)
                 })
             }
             val wifi = JSONObject().put("networks", wifiNetworks)
-            val cellEntries = JSONArray()
-            listOf("LTE", "NR", "WCDMA", "GSM", "CDMA").forEachIndexed { index, type ->
-                cellEntries.put(JSONObject().apply {
-                    put("type", type); put("mcc", 460); put("mnc", 11 + index)
-                    put("tac", 1000 + seq % 1000); put("ci", 100000 + seq % 100000)
-                    put("nci", 1000000L + (seq.toLong() % 60000000000L)); put("psc", 100 + index); put("lac", 200 + index)
-                    put("cid", 10000 + seq % 40000); put("bid", 1 + index); put("nid", 300 + index); put("sid", 400 + index)
-                })
+            val liveCells = parseCellEntries()
+            val cellEntries = if (liveCells.length() > 0) liveCells else JSONArray().apply {
+                put(JSONObject().apply { put("type", "LTE"); put("mcc", 460); put("mnc", 0); put("ci", 100000 + cellSequence % 100000) })
             }
             val cell = JSONObject().put("entries", cellEntries)
-            rememberRemoteExpectation("bluetooth", data, seq)
-            rememberRemoteExpectation("wifi", wifi, seq)
-            rememberRemoteExpectation("cell", cell, seq)
-            listOf("bluetooth" to data, "wifi" to wifi, "cell" to cell).forEach { (type, value) ->
-                remoteSocket?.send(JSONObject().apply { put("type", "environment_data"); put("version", 1); put("device_id", remoteDeviceInput.text.toString().trim()); put("data_type", type); put("timestamp", System.currentTimeMillis()); put("sequence", seq); put("data", value) }.toString())
+            rememberRemoteExpectation("bluetooth", data, bluetoothSequence)
+            rememberRemoteExpectation("wifi", wifi, wifiSequence)
+            rememberRemoteExpectation("cell", cell, cellSequence)
+            listOf(
+                Triple("bluetooth", data, bluetoothSequence),
+                Triple("wifi", wifi, wifiSequence),
+                Triple("cell", cell, cellSequence),
+            ).forEach { (type, value, sequence) ->
+                remoteSocket?.send(JSONObject().apply {
+                    put("type", "environment_data"); put("version", 1); put("device_id", deviceId)
+                    put("data_type", type); put("timestamp", System.currentTimeMillis())
+                    put("sequence", sequence); put("data", value)
+                }.toString())
             }
-            Thread.sleep(3000)
+            remoteLastUploadSummary = "BT=${bleDevices.length()} 条(seq=$bluetoothSequence) WiFi=${wifiNetworks.length()} 条(seq=$wifiSequence) Cell=${cellEntries.length()} 条(seq=$cellSequence)"
+            runOnUiThread { if (::remoteResult.isInitialized) remoteResult.text = buildRemoteComparisonResult() }
+            Thread.sleep(2500L + java.util.concurrent.ThreadLocalRandom.current().nextLong(1500L))
         }
     }
 
