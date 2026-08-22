@@ -807,11 +807,6 @@ class MainActivity : Activity() {
             append("远程认证：").append(if (remoteAuthenticated.get()) "PASS" else "未认证").append('\n')
             append("服务端测试：").append(if (uploadedPresent) "PASS" else "等待/未通过").append('\n')
             append("最近上传：").append(remoteLastUploadSummary).append('\n')
-            append("远程数据匹配：").append(if (moduleTypesPass) "PASS" else "等待/未通过").append('\n')
-            append("模块数据对比：").append(if (moduleTypesPass) "PASS" else "等待/未通过").append('\n')
-            append("  WiFi：").append(if (localWifiPass) "PASS" else "FAIL").append(" ($wifiMatched/$wifiTotal)").append('\n')
-            append("  Cell：").append(if (localCellPass) "PASS" else "FAIL").append(" ($cellMatched/$cellTotal)").append('\n')
-            append("  BLE：").append(if (localBlePass) "PASS" else "FAIL").append(" ($bleMatched/$bleTotal)").append('\n')
             append("服务端 ACK：").append(ackTypes.sorted().joinToString(", ").ifEmpty { "无" }).append('\n')
             append("序号：").append(remoteAckedSequences.entries.joinToString { "${it.key}=${it.value}" }.ifEmpty { "无" }).append('\n')
             append("ACK 年龄：").append(remoteAckAt.entries.joinToString { "${it.key}=${(now - it.value).coerceAtLeast(0L)}ms" }.ifEmpty { "无" })
@@ -1150,7 +1145,6 @@ class MainActivity : Activity() {
         }
         refreshFuture?.cancel(false)
         refreshFuture = null
-        stopRemoteUploadTest()
         if (::startButton.isInitialized) startButton.isEnabled = true
         if (::stopButton.isInitialized) stopButton.isEnabled = false
         try {
@@ -1189,7 +1183,7 @@ class MainActivity : Activity() {
             }
         } catch (_: Throwable) {
         }
-        // 结束按钮：清空全部数据结果，并结束 Hook 层观测
+        // 结束按钮只结束本地检测；服务端 Collector 由其独立按钮控制。
         clearResults()
         refreshExecutor.execute {
             apiPost("/api/debug/observe/end", JSONObject())
