@@ -11,8 +11,8 @@
 
 ## 1. 为什么需要检测器
 
-模块无法 Hook 自身，因此模块控制端 App 内"传感器/基站/BLE 是否被虚拟化"的检测结果不可靠。
-VirEnvDetector 作为独立第三方 App，被加入模块的 LSPosed 作用域后：
+模块控制端不能 Hook 自身，因此使用独立测试组件从普通应用视角验证环境数据。
+VirEnvDetector 作为项目配套测试组件，被加入模块的 LSPosed 作用域后：
 
 1. 模块的 `FrameworkEnvHookAdapter` 会在检测器进程生效（虚拟位置/基站/BLE/WiFi/传感器/GNSS）；
 2. 检测器同时直接调用模块本地 API（`127.0.0.1:18790`），拉取**期望配置**；
@@ -92,7 +92,7 @@ adb shell am start -n io.github.fairyxh.VirEnvDetector/.MainActivity
 - **随机模拟**：一键调用 `/api/debug/random-env` 生成全套随机虚拟环境并启用，随后自动开始检测（推荐用于验证全链路）
 - **服务端测试（可选）**：在本地检测基础上上传随机 Bluetooth/WiFi/Cell 数据，等待服务端 ACK，并与检测器从模块实际读取的数据做条目存在性对比；不影响本地检测能力
 - 服务端 URL、Token、Device ID、最近测试状态和结果会保存在检测器私有设置中
-- **结束**：停止刷新与上报，保留最后一次快照
+- **结束**：停止刷新与上报，注销监听器并清空本次检测结果；支持重复调用，便于 Activity 生命周期收尾和自动化测试
 
 ---
 
