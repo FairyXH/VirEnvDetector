@@ -90,7 +90,7 @@ adb shell am start -n io.github.fairyxh.VirEnvDetector/.MainActivity
 
 - **开始检测**：按当前模块配置实时检测并上报
 - **随机模拟**：一键调用 `/api/debug/random-env` 生成全套随机虚拟环境并启用，随后自动开始检测（推荐用于验证全链路）
-- **服务端测试（可选）**：只有点击“开始远程测试”后才建立 Collector WebSocket，上传覆盖多条 LTE/NR/WCDMA/GSM/CDMA 基站、WiFi 网络和 BLE 广播记录的数据集；服务端 ACK、序号和普通 App 本机标准 API 实读结果共同决定权威判定。报告按类型输出 `matched/total`，必须覆盖当前轮次全部上传条目才判定 PASS
+- **服务端测试（可选）**：只有点击“开始远程测试”后才建立 Collector WebSocket，使用与通用 Collector 相同的 `environment_data` Envelope 和 `data` 容器格式。每轮上传覆盖 2.4GHz/5GHz/6GHz WiFi、BLE/双模/经典蓝牙，以及 LTE/NR/WCDMA/GSM/CDMA 全部基站类型；蓝牙 BLE/双模保留完整 Base64 RAW、HEX、长度、厂商数据和 Service Data。服务端 ACK、序号和普通 App 本机标准 API 实读结果共同决定权威判定。报告按类型输出 `matched/total`，必须覆盖当前轮次全部上传条目才判定 PASS
 - 服务端 URL、Token、Device ID、最近测试状态和结果会保存在检测器私有设置中
 - **结束**：停止刷新与上报，注销监听器并清空本次检测结果；支持重复调用，便于 Activity 生命周期收尾和自动化测试
 
