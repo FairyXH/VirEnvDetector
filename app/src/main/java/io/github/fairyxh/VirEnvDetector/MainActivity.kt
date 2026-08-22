@@ -772,9 +772,14 @@ class MainActivity : Activity() {
             if (localEntries != null && localEntries.length() > 0) {
                 (0 until localEntries.length()).any { localIndex ->
                     val local = localEntries.optJSONObject(localIndex) ?: return@any false
-                    val localIdentity = listOf("nci", "ci", "cid", "sid")
-                        .firstNotNullOfOrNull { key -> local.optString(key, "").takeIf { it.isNotEmpty() && it != "-1" } }
-                    localIdentity == identity
+                    val localType = local.optString("type", "")
+                    val localIdentity = when (localType) {
+                        "NR" -> local.optString("nci", "")
+                        "GSM", "WCDMA" -> local.optString("cid", "")
+                        "CDMA" -> local.optString("sid", "")
+                        else -> local.optString("ci", "")
+                    }
+                    localType.equals(type, ignoreCase = true) && localIdentity == identity
                 }
             } else {
                 type.isNotEmpty() && lastCellText.contains(type, ignoreCase = true) && lastCellText.contains(identity)
@@ -2222,21 +2227,61 @@ class MainActivity : Activity() {
         return sb.toString().trim().ifEmpty { "无 BLE 结果（等待扫描回调）" }
     }
 
+    private fun cellString(identity: Any, method: String): String = runCatching {
+        identity.javaClass.getMethod(method).invoke(identity) as? String ?: ""
+    }.getOrDefault("")
+
     private fun parseCellEntries(): JSONArray {
         val tm = telephonyManager ?: return JSONArray()
         val result = JSONArray()
+        val seen = mutableSetOf<String>()
         runCatching {
             (tm.allCellInfo ?: emptyList()).forEach { info ->
                 val item = JSONObject().put("class", info.javaClass.simpleName)
                 when (info) {
-                    is CellInfoLte -> item.put("ci", info.cellIdentity.ci)
-                    is CellInfoNr -> item.put("nci", runCatching {
-                        info.cellIdentity.javaClass.getMethod("getNci").invoke(info.cellIdentity)
-                    }.getOrDefault(-1L))
-                    is CellInfoGsm -> item.put("cid", info.cellIdentity.cid)
-                    is CellInfoWcdma -> item.put("cid", info.cellIdentity.cid)
+                    is CellInfoLte -> item.apply {
+                        put("type", "LTE")
+                        put("mcc", cellString(info.cellIdentity, "getMccString"))
+                        put("mnc", cellString(info.cellIdentity, "getMncString"))
+                        put("ci", info.cellIdentity.ci)
+                    }
+                    is CellInfoNr -> item.apply {
+                        put("type", "NR")
+                        val identity = info.cellIdentity
+                        put("mcc", cellString(identity, "getMccString"))
+                        put("mnc", cellString(identity, "getMncString"))
+                        put("nci", runCatching {
+                            identity.javaClass.getMethod("getNci").invoke(identity)
+                        }.getOrDefault(-1L))
+                    }
+                    is CellInfoGsm -> item.apply {
+                        put("type", "GSM")
+                        put("mcc", cellString(info.cellIdentity, "getMccString"))
+                        put("mnc", cellString(info.cellIdentity, "getMncString"))
+                        put("cid", info.cellIdentity.cid)
+                        put("lac", info.cellIdentity.lac)
+                    }
+                    is CellInfoWcdma -> item.apply {
+                        put("type", "WCDMA")
+                        put("mcc", cellString(info.cellIdentity, "getMccString"))
+                        put("mnc", cellString(info.cellIdentity, "getMncString"))
+                        put("cid", info.cellIdentity.cid)
+                        put("lac", info.cellIdentity.lac)
+                    }
+                    is CellInfoCdma -> item.put("type", "CDMA")
                 }
-                result.put(item)
+                val type = item.optString("type", "")
+                val identity = when (type) {
+                    "NR" -> item.optLong("nci", -1L)
+                    "GSM", "WCDMA" -> item.optLong("cid", -1L)
+                    "LTE" -> item.optLong("ci", -1L)
+                    else -> -1L
+                }
+                // Oplus may return placeholder CellInfo rows with identity 0 or a
+                // repeated identity. They are not useful remote evidence and make
+                // the UI appear as ci=0 for every row.
+                if (type.isEmpty() || identity <= 0L) return@forEach
+                if (seen.add("$type:$identity")) result.put(item)
             }
         }
         return result
