@@ -1528,8 +1528,8 @@ class MainActivity : Activity() {
             val mnc = e.optInt("mnc", -1)
             val type = e.optString("type", "LTE").uppercase()
             if (mcc >= 0 && mnc >= 0 &&
-                lastCellText.contains("mcc=$mcc") && lastCellText.contains("mnc=$mnc")
-            ) {
+                lastCellText.contains("mcc=$mcc") &&
+                (lastCellText.contains("mnc=$mnc") || lastCellText.contains("mnc=unavail"))) {
                 val hit = when (type) {
                     "NR" -> {
                         val nci = e.optLong("nci", -1L)
