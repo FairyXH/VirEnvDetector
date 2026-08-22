@@ -741,23 +741,38 @@ class MainActivity : Activity() {
         val expectedTypes = remoteUploadExpected.keys.toSet()
         val ackTypes = remoteAckedTypes.toSet()
         val uploadedPresent = expectedTypes.isNotEmpty() && expectedTypes.all { it in ackTypes }
-        val localWifiPass = remoteExpectedHistory["wifi"]?.any { expected ->
-            val ssid = expected.optJSONArray("networks")?.optJSONObject(0)?.optString("ssid", "") ?: ""
-            ssid.isNotEmpty() && (lastWifiNetworks?.toString()?.contains(ssid) == true || lastWifiText.contains(ssid))
-        } == true
-        val localCellPass = remoteExpectedHistory["cell"]?.any { expected ->
-            val ci = expected.optJSONArray("entries")?.optJSONObject(0)?.optString("ci", "") ?: ""
-            ci.isNotEmpty() && (lastCellEntries?.toString()?.contains(ci) == true || lastCellText.contains(ci))
-        } == true
-        val localBlePass = remoteExpectedHistory["bluetooth"]?.any { expected ->
-            val device = expected.optJSONArray("devices")?.optJSONObject(0)
-            val address = device?.optString("address", "") ?: ""
-            val raw = device?.optString("raw", "") ?: ""
+        val wifiExpected = remoteExpectedHistory["wifi"]?.lastOrNull()?.optJSONArray("networks")
+        val cellExpected = remoteExpectedHistory["cell"]?.lastOrNull()?.optJSONArray("entries")
+        val bleExpected = remoteExpectedHistory["bluetooth"]?.lastOrNull()?.optJSONArray("devices")
+        val wifiMatched = (0 until (wifiExpected?.length() ?: 0)).count { index ->
+            val item = wifiExpected?.optJSONObject(index) ?: return@count false
+            val ssid = item.optString("ssid", "")
+            val bssid = item.optString("bssid", "").uppercase()
+            (ssid.isNotEmpty() && (lastWifiNetworks?.toString()?.contains(ssid) == true || lastWifiText.contains(ssid))) ||
+                (bssid.isNotEmpty() && lastWifiText.uppercase().contains(bssid))
+        }
+        val cellMatched = (0 until (cellExpected?.length() ?: 0)).count { index ->
+            val item = cellExpected?.optJSONObject(index) ?: return@count false
+            val type = item.optString("type", "")
+            val identity = listOf("ci", "nci", "psc", "lac", "cid", "bid", "nid", "sid")
+                .firstNotNullOfOrNull { key -> item.optString(key, "").takeIf { it.isNotEmpty() } }
+            type.isNotEmpty() && identity != null && lastCellText.contains(type, ignoreCase = true) && lastCellText.contains(identity)
+        }
+        val bleMatched = (0 until (bleExpected?.length() ?: 0)).count { index ->
+            val item = bleExpected?.optJSONObject(index) ?: return@count false
+            val address = item.optString("address", "").uppercase()
+            val raw = item.optString("raw", "")
             synchronized(bleFound) {
-                (address.isNotEmpty() && bleFound.containsKey(address)) ||
+                (address.isNotEmpty() && bleFound.keys.any { it.uppercase() == address }) ||
                     (raw.isNotEmpty() && bleRaw.values.any { entry -> entry.toString().contains(raw) })
             }
-        } == true
+        }
+        val wifiTotal = wifiExpected?.length() ?: 0
+        val cellTotal = cellExpected?.length() ?: 0
+        val bleTotal = bleExpected?.length() ?: 0
+        val localWifiPass = wifiTotal > 0 && wifiMatched == wifiTotal
+        val localCellPass = cellTotal > 0 && cellMatched == cellTotal
+        val localBlePass = bleTotal > 0 && bleMatched == bleTotal
         val moduleTypesPass = localWifiPass && localCellPass && localBlePass
         val now = System.currentTimeMillis()
         return buildString {
@@ -766,9 +781,9 @@ class MainActivity : Activity() {
             append("服务端测试：").append(if (uploadedPresent) "PASS" else "等待/未通过").append('\n')
             append("远程数据匹配：").append(if (moduleTypesPass) "PASS" else "等待/未通过").append('\n')
             append("模块数据对比：").append(if (moduleTypesPass) "PASS" else "等待/未通过").append('\n')
-            append("  WiFi：").append(if (localWifiPass) "PASS" else "未发现上报 SSID").append('\n')
-            append("  Cell：").append(if (localCellPass) "PASS" else "未发现上报 CI").append('\n')
-            append("  BLE：").append(if (localBlePass) "PASS" else "未发现上报设备/RAW").append('\n')
+            append("  WiFi：").append(if (localWifiPass) "PASS" else "FAIL").append(" ($wifiMatched/$wifiTotal)").append('\n')
+            append("  Cell：").append(if (localCellPass) "PASS" else "FAIL").append(" ($cellMatched/$cellTotal)").append('\n')
+            append("  BLE：").append(if (localBlePass) "PASS" else "FAIL").append(" ($bleMatched/$bleTotal)").append('\n')
             append("服务端 ACK：").append(ackTypes.sorted().joinToString(", ").ifEmpty { "无" }).append('\n')
             append("序号：").append(remoteAckedSequences.entries.joinToString { "${it.key}=${it.value}" }.ifEmpty { "无" }).append('\n')
             append("ACK 年龄：").append(remoteAckAt.entries.joinToString { "${it.key}=${(now - it.value).coerceAtLeast(0L)}ms" }.ifEmpty { "无" })
@@ -793,19 +808,41 @@ class MainActivity : Activity() {
             }
             val seq = ++remoteSequence
             val rawHex = "0201060AFF4C000215111213141516171819"
-            val data = JSONObject().apply {
-                put("devices", JSONArray().put(JSONObject().apply {
-                    put("name", "Detector-BLE-$seq"); put("address", "02:00:00:00:00:01"); put("rssi", -55)
-                    put("rawHex", rawHex); put("rawLength", rawHex.length / 2)
-                    put("raw", android.util.Base64.encodeToString(ByteArray(rawHex.length / 2) { i -> rawHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }, android.util.Base64.NO_WRAP))
+            val rawBytes = ByteArray(rawHex.length / 2) { i -> rawHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
+            val raw = android.util.Base64.encodeToString(rawBytes, android.util.Base64.NO_WRAP)
+            val bleDevices = JSONArray()
+            repeat(5) { index ->
+                bleDevices.put(JSONObject().apply {
+                    put("name", "Detector-BLE-$seq-$index")
+                    put("address", String.format("02:00:00:%02X:%02X:%02X", seq and 0xff, index, (seq + index) and 0xff))
+                    put("rssi", -45 - index * 5)
+                    put("raw", raw); put("rawHex", rawHex); put("rawLength", rawBytes.size)
                 })
-            )}
+            }
+            val data = JSONObject().put("devices", bleDevices)
+            val wifiNetworks = JSONArray()
+            repeat(5) { index ->
+                wifiNetworks.put(JSONObject().apply {
+                    put("ssid", "Detector-WiFi-$seq-$index")
+                    put("bssid", String.format("AA:BB:%02X:%02X:%02X:%02X", seq and 0xff, index, (seq shr 8) and 0xff, (seq + index) and 0xff))
+                    put("rssi", -40 - index * 6); put("frequency", 2412 + index * 5)
+                })
+            }
+            val wifi = JSONObject().put("networks", wifiNetworks)
+            val cellEntries = JSONArray()
+            listOf("LTE", "NR", "WCDMA", "GSM", "CDMA").forEachIndexed { index, type ->
+                cellEntries.put(JSONObject().apply {
+                    put("type", type); put("mcc", 460); put("mnc", 11 + index)
+                    put("tac", 1000 + seq % 1000); put("ci", seq + index)
+                    put("nci", seq.toLong() + index); put("psc", 100 + index); put("lac", 200 + index)
+                    put("cid", seq + index); put("bid", seq + index); put("nid", 300 + index); put("sid", 400 + index)
+                })
+            }
+            val cell = JSONObject().put("entries", cellEntries)
             rememberRemoteExpectation("bluetooth", data, seq)
-            rememberRemoteExpectation("wifi", JSONObject().put("networks", JSONArray().put(JSONObject().put("ssid", "Detector-WiFi-$seq").put("rssi", -50))), seq)
-            rememberRemoteExpectation("cell", JSONObject().put("entries", JSONArray().put(JSONObject().put("type", "LTE").put("ci", seq))), seq)
-            val payload = JSONObject().apply { put("type", "environment_data"); put("version", 1); put("device_id", remoteDeviceInput.text.toString().trim()); put("data_type", "bluetooth"); put("timestamp", System.currentTimeMillis()); put("sequence", seq); put("data", data) }
-            remoteSocket?.send(payload.toString())
-            listOf("wifi" to JSONObject().put("networks", JSONArray().put(JSONObject().put("ssid", "Detector-WiFi-$seq").put("rssi", -50))), "cell" to JSONObject().put("entries", JSONArray().put(JSONObject().put("type", "LTE").put("ci", seq)))).forEach { (type, value) ->
+            rememberRemoteExpectation("wifi", wifi, seq)
+            rememberRemoteExpectation("cell", cell, seq)
+            listOf("bluetooth" to data, "wifi" to wifi, "cell" to cell).forEach { (type, value) ->
                 remoteSocket?.send(JSONObject().apply { put("type", "environment_data"); put("version", 1); put("device_id", remoteDeviceInput.text.toString().trim()); put("data_type", type); put("timestamp", System.currentTimeMillis()); put("sequence", seq); put("data", value) }.toString())
             }
             Thread.sleep(3000)
@@ -915,14 +952,6 @@ class MainActivity : Activity() {
         startButton.isEnabled = false
         stopButton.isEnabled = true
         statusView.text = "检测中…（每秒刷新 + 上报报告）"
-
-        if (remoteUrlInput.text.toString().trim().isNotEmpty() &&
-            remoteTokenInput.text.toString().trim().isNotEmpty() &&
-            remoteDeviceInput.text.toString().trim().isNotEmpty() &&
-            !remoteTestRunning.get()
-        ) {
-            startRemoteUploadTest()
-        }
 
         val ctx: Context = applicationContext
         locationManager = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
@@ -1111,11 +1140,6 @@ class MainActivity : Activity() {
             if (obs != null) hookObserveJson = obs
         } catch (_: Throwable) {
         }
-        val remoteDiagnostic = try {
-            apiGet("/api/debug/remote/snapshot")
-        } catch (_: Throwable) {
-            null
-        }
         renderObserve()
 
         val report = JSONObject().apply {
@@ -1242,7 +1266,6 @@ class MainActivity : Activity() {
         }
         renderPlayback(report)
         report.put("hookObserve", hookObserveJson ?: JSONObject())
-        report.put("remoteReceived", remoteDiagnostic ?: JSONObject())
         report.put("remoteTest", JSONObject().apply {
             put("running", remoteTestRunning.get())
             put("authenticated", remoteAuthenticated.get())
