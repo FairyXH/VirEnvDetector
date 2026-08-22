@@ -160,6 +160,11 @@ class MainActivity : Activity() {
     private val refreshExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "ZVE-DetectorRefresh").apply { isDaemon = true }
     }
+    private val captureExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "ZVE-ContinuousCapture").apply { isDaemon = true }
+    }
+    @Volatile
+    private var captureFuture: java.util.concurrent.Future<*>? = null
     @Volatile
     private var refreshFuture: java.util.concurrent.ScheduledFuture<*>? = null
 
@@ -566,6 +571,10 @@ class MainActivity : Activity() {
         val savedRemoteResult = saved.getString(KEY_REMOTE_RESULT, remoteResult.text.toString()) ?: remoteResult.text.toString()
         remoteResult.text = if (savedRemoteResult.isBlank()) "尚未运行远程测试" else "历史结果（重新点击开始远程测试后更新）\\n$savedRemoteResult"
         remoteStatus.text = if (saved.getString(KEY_REMOTE_STATE, "").isNullOrBlank()) "未启用服务端测试" else "${saved.getString(KEY_REMOTE_STATE, "未启用服务端测试")}（历史状态）"
+
+        val forceRefreshButton = Button(this).apply { text = "刷新全部信息" }
+        container.addView(forceRefreshButton)
+        forceRefreshButton.setOnClickListener { forceRefreshAll() }
 
         val loc = section(container, "位置")
         locationView = loc.first
@@ -1120,12 +1129,66 @@ class MainActivity : Activity() {
             apiPost("/api/debug/observe/start", JSONObject())
             refreshExpectations()
         }
-        refreshFuture = refreshExecutor.scheduleWithFixedDelay(
-            refreshRunnable,
-            100,
-            REFRESH_MS,
-            java.util.concurrent.TimeUnit.MILLISECONDS
-        )
+        captureFuture = captureExecutor.submit { continuousCaptureLoop() }
+    }
+
+    private fun continuousCaptureLoop() {
+        while (running.get()) {
+            try {
+                forceHardwareScan()
+                refreshAll()
+            } catch (t: Throwable) {
+                Log.w(TAG, "continuous capture cycle failed", t)
+            }
+            try {
+                Thread.sleep(REFRESH_MS)
+            } catch (_: InterruptedException) {
+                break
+            }
+        }
+    }
+
+    private fun forceHardwareScan() {
+        try {
+            locationManager?.requestLocationUpdates(LocationManager.GPS_PROVIDER, 0L, 0f, locationListener, Looper.getMainLooper())
+            locationManager?.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 0L, 0f, locationListener, Looper.getMainLooper())
+        } catch (_: Throwable) {
+        }
+        try {
+            telephonyManager?.listen(telephonyListener, PhoneStateListener.LISTEN_SERVICE_STATE or PhoneStateListener.LISTEN_SIGNAL_STRENGTHS)
+        } catch (_: Throwable) {
+        }
+        try {
+            bleScanner?.stopScan(bleScanCallback)
+            bleScanner?.startScan(bleScanCallback)
+        } catch (t: Throwable) {
+            Log.w(TAG, "continuous BLE scan failed", t)
+        }
+        try {
+            BluetoothAdapter.getDefaultAdapter()?.let {
+                it.cancelDiscovery()
+                it.startDiscovery()
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "continuous classic Bluetooth scan failed", t)
+        }
+        try {
+            wifiManager?.startScan()
+        } catch (t: Throwable) {
+            Log.w(TAG, "continuous WiFi scan failed", t)
+        }
+    }
+
+    private fun forceRefreshAll() {
+        if (!hasPermissions()) {
+            requestPermissions(REQUIRED_PERMS.toTypedArray(), 100)
+            return
+        }
+        if (!running.get()) doStart()
+        captureExecutor.execute {
+            forceHardwareScan()
+            refreshAll(judgeNow = true)
+        }
     }
 
     private fun onStopDetect() {
@@ -1137,8 +1200,10 @@ class MainActivity : Activity() {
         }
         refreshFuture?.cancel(false)
         refreshFuture = null
+        captureFuture?.cancel(true)
+        captureFuture = null
         if (::startButton.isInitialized) startButton.isEnabled = true
-        if (::stopButton.isInitialized) stopButton.isEnabled = false
+        if (::stopButton.isInitialized) stopButton.isEnabled = true
         try {
             sensorManager?.unregisterListener(stepListener)
             sensorManager?.unregisterListener(rawSensorListener)
@@ -1184,7 +1249,8 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        onStopDetect()
+        // 仅由 Activity 销毁路径停止；页面清除按钮不能停止采集。
+        if (isFinishing || isChangingConfigurations) onStopDetect()
         super.onDestroy()
     }
 
@@ -1943,49 +2009,16 @@ class MainActivity : Activity() {
         }
     }
 
-    /** 结束检测后清空全部数据结果（修复：结束按钮应清空而非保留最后一次快照）。 */
+    /** 结束检测后清空判定结果，但不清除正在持续采集的数据。 */
     private fun clearResults() {
-        lastLocation = null
-        lastCellText = "无基站（等待读取）"
-        lastWifiText = "无扫描结果"
-        lastSimText = "无 SIM 数据（等待读取）"
-        lastStepCount = -1L
-        lastGnssStatus = null
-        sensorRaw.clear()
-        synchronized(bleFound) { bleFound.clear(); bleRaw.clear() }
-        expectEnv = null
-        expectLocation = null
-        expectRoute = null
-        playbackStatusJson = null
-        hookObserveJson = null
-        lastPlaybackFrame = -1
-        lastExpectFingerprint = ""
-        configChangedAtMs = 0L
-        lastSensorUiMs = 0L
-        lastBleUiMs = 0L
-        lastNmeaText = ""
-        lastBtIdentityText = ""
+        latestReport = null
         runOnUiThread {
             val gray = Color.parseColor("#9E9E9E")
-            fun reset(view: TextView, status: TextView) {
-                view.text = "未开始"
-                status.text = "-"
-                status.setTextColor(gray)
+            listOf(locationStatus, cellStatus, bleStatus, wifiStatus, sensorStatus, gnssStatus, simStatus).forEach {
+                it.text = "-"
+                it.setTextColor(gray)
             }
-            reset(locationView, locationStatus)
-            reset(cellView, cellStatus)
-            reset(bleView, bleStatus)
-            reset(wifiView, wifiStatus)
-            reset(sensorView, sensorStatus)
-            reset(gnssView, gnssStatus)
-            reset(simView, simStatus)
-            playbackView.text = "未开始"
-            playbackStatus.text = "-"
-            playbackStatus.setTextColor(gray)
-            hookObserveView.text = "未开始"
-            hookObserveStatus.text = "-"
-            hookObserveStatus.setTextColor(gray)
-            statusView.text = "已停止，结果已清空"
+            statusView.text = "持续采集中…（每秒刷新；开始按钮只判定）"
         }
     }
 
