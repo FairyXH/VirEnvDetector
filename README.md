@@ -1,235 +1,154 @@
-# VirEnvDetector — 环境虚拟化检测器
+# VirEnvDetector
 
-独立 Android 应用（`io.github.fairyxh.VirEnvDetector`），用于从**普通 App 视角**验证
-[ZhangVirtualEnv](../ZhangVirtualEnv/README.md) 模块的环境虚拟化是否真正生效。
+VirEnvDetector 是一个独立的 Android 测试校验工具，用于从应用侧读取标准 Android API 数据，并验证受控测试数据是否按预期生效。项目面向 Android 开发调试、自动化回归和系统兼容性验证，不针对任何特定应用或在线服务提供适配。
 
-> 它是 ZhangVirtualEnv 生态的一部分，但作为独立 Gradle 工程维护（复用主模块的 Gradle/AGP 版本，避免与模块混淆）。
+## 能力概览
 
-> 该检测器需要和Lsposed模块搭配使用，用于为其检测虚拟环境是否生效：[ZhangVirtualEnv](https://github.com/FairyXH/ZhangVirtualEnv)
+- 持续读取位置、轨迹、GNSS、蜂窝网络、Wi-Fi、Bluetooth/BLE、传感器和订阅信息；
+- 展示原始读取摘要、最近更新时间和当前校验状态；
+- 将实读结果与测试配置或远程采集快照进行逐项比对；
+- 支持单次校验、持续刷新、配置切换后的同步等待和结果清理；
+- 支持通过受保护的本地接口加载示例测试配置、读取状态和提交测试报告；
+- 支持受控远程数据源的连接状态、数据新鲜度、序号与 ACK 结果观察；
+- 可导出或保存最近测试结果，便于脚本、CI 和兼容性回归使用。
 
----
+校验状态包括：
 
-## 1. 为什么需要检测器
+| 状态 | 含义 |
+| --- | --- |
+| `PASS` | 实读数据满足当前测试配置的校验条件 |
+| `FAIL` | 已启用的测试项与实读结果不一致 |
+| `SYNCING` | 配置刚发生变化，正在等待数据链路同步 |
+| `NOT_ENABLED` | 当前测试项未启用，无法进行配置一致性校验 |
+| `UNKNOWN` | 数据暂不可读、为空或系统未提供对应能力 |
 
-模块控制端不能 Hook 自身，因此使用独立测试组件从普通应用视角验证环境数据。
-VirEnvDetector 作为项目配套测试组件，被加入模块的 LSPosed 作用域后：
+## 校验范围
 
-1. 模块的 `FrameworkEnvHookAdapter` 会在检测器进程生效（虚拟位置/基站/BLE/WiFi/传感器/GNSS）；
-2. 检测器同时直接调用模块本地 API（`127.0.0.1:18790`），拉取**期望配置**；
-3. 将"实读环境"与"期望配置"逐项比对，输出 `PASS / FAIL / SYNCING / NOT_ENABLED / UNKNOWN`；
-4. 报告上报到 `/api/test/report`，供自动化回归验证。
+| 测试项 | Android 数据来源 | 常见校验内容 |
+| --- | --- | --- |
+| Location | `LocationManager` | 坐标、提供方、更新时间、轨迹点 |
+| GNSS | `GnssStatus.Callback`、NMEA 回调 | 卫星数量、使用状态、星座、信号摘要和回调时序 |
+| Cell | `TelephonyManager.getAllCellInfo()` | 网络制式及公开的小区标识字段 |
+| Wi-Fi | `WifiManager.getScanResults()` | 网络标识、信号强度、频率和扫描更新时间 |
+| Bluetooth/BLE | 扫描回调与 `ScanRecord` | 设备标识、广播摘要、信号强度、服务数据和时间戳 |
+| Sensor | `SensorManager` | 传感器类型、事件序列、步频或累计值 |
+| Subscription | `TelephonyManager` | 订阅状态、网络配置和可公开读取的摘要字段 |
 
-一句话：**检测器 = 第三方视角 + 期望配置对照 + 全链路回归工具**。
+校验结果只说明 Android API 数据面是否符合测试配置，不代表真实硬件、射频链路或网络侧状态。
 
----
+## 架构
 
-## 2. 检测项
+```text
+┌──────────────────────────────┐
+│ VirEnvDetector                │
+│ UI、监听器、数据摘要与判定     │
+└──────────────┬───────────────┘
+               │ 本地受保护测试接口
+┌──────────────▼───────────────┐
+│ 测试数据控制端                 │
+│ 配置、状态、快照、报告与远程桥接 │
+└──────────────┬───────────────┘
+               │ Android 标准 API
+┌──────────────▼───────────────┐
+│ 受测 Android 测试环境           │
+│ Location / Telephony / GNSS   │
+│ Wi-Fi / Bluetooth / Sensor    │
+└──────────────────────────────┘
+```
 
-| 检测项 | 实读来源 | 判定依据 |
-|---|---|---|
-| location | `LocationManager` GPS/Network/Passive 最新位置 | 与 `/api/location/status` 期望坐标距离 ≤ 容差（单点 300m / 路线 500m） |
-| cell | `TelephonyManager.getAllCellInfo()` | 期望 `entries` 中存在 mcc/mnc/tac/ci 与实读匹配 |
-| ble | `BluetoothLeScanner.startScan` 回调 | 期望 `devices` 中任一 address 出现在扫描结果 |
-| wifi | `WifiManager.getScanResults()` | 期望 `networks` 中任一 ssid/bssid 出现在结果 |
-| sensor | `SensorManager` 计步器回调 | 期望 `stepFrequency`/`events` 启用且收到步数事件 |
-| gnss | `GnssStatus.Callback` | 期望卫星数/使用数 ≥ 80% 匹配虚拟状态 |
-| sim | `TelephonyManager`（createForSubscriptionId 读取国家码/运营商/IMSI/ICCID/信号） | 期望 `slots` 中任一卡槽的 mcc/mnc/运营商/IMSI/ICCID 命中实读文本 |
+检测器在后台线程执行网络和扫描操作，在主线程更新界面。页面打开期间持续刷新数据；Activity 销毁时注销监听器并释放资源。配置变更后会进入有限时长的同步状态，避免把瞬时不一致直接判定为失败。
 
-每个检测项 UI 同时展示：
-- 实读数据明细（坐标/小区字段/设备列表/步数/卫星数）
-- 判定徽标（通过/未通过/同步中/未启用模拟/未知）
+## 环境要求
 
----
+- Android 10 或更高版本；
+- 用于测试的设备、系统镜像和测试数据均应由使用者控制或获得授权；
+- 如需读取对应数据，系统必须授予定位、附近设备、Wi-Fi 和电话等运行时权限；
+- 如需验证系统级测试数据，需要同时运行匹配的测试控制端，并按设备要求完成系统测试环境配置。
 
-## 3. 判定语义
-
-| 徽标 | 含义 |
-|---|---|
-| **通过（绿）** | 实读数据与虚拟期望一致 |
-| **未通过（红）** | 期望已启用但实读与期望不一致（真实数据泄漏或 Hook 失效） |
-| **同步中（橙）** | 期望配置刚切换（2s 宽限期），Hook 层缓存可能尚未追平，暂不判失败 |
-| **未启用模拟（灰）** | 模块该类型未启用，实读为真实数据属正常 |
-| **未知（灰）** | 无法读取或无数据 |
-
-> 配置切换宽限期：`random-env` 或手动切换配置后，模块 `EnvStateCache`（500ms 轮询）
-> 与 BLE/GNSS 的"配置就绪后接管"需要约 2s 完成；此期间 FAIL 自动降级为 SYNCING，
-> 避免瞬时误报。
-
----
-
-## 4. 使用方法
-
-### 4.1 环境要求
-
-- Android 10+（当前验证 Oplus Android 15）
-- 已安装并启用 ZhangVirtualEnv 模块（LSPosed）
-- 检测器已被加入模块 `scope.list`（默认已包含）
-
-### 4.2 构建
+## 构建、安装与运行
 
 ```bash
 cd VirEnvDetector
 ./gradlew assembleDebug --no-daemon
-```
 
-产物：`app/build/outputs/apk/debug/app-debug.apk`
-
-### 4.3 安装与启动
-
-```bash
 adb install -r app/build/outputs/apk/debug/app-debug.apk
-
-# 启动
 adb shell am start -n io.github.fairyxh.VirEnvDetector/.MainActivity
 ```
 
-首次启动授予权限（定位、蓝牙、WiFi、电话）。模块更新后如需重新加载 Hook：
-`adb install -r` 后 **`adb reboot`**。
+Windows PowerShell 可使用：
 
-### 4.4 操作
+```powershell
+.\\gradlew.bat assembleDebug --console=plain --no-daemon > build.log 2>&1
+Get-Content build.log -Tail 80
+```
 
-- **开始检测**：仅对当前已持续采集到的最新数据执行一次判定；不会启动采集。打开检测器后即自动注册监听器，并每秒刷新所有类型数据
-- **持续采集**：位置、基站、蓝牙 BLE、WiFi、传感器、GNSS、SIM 和模块状态在检测器打开期间持续获取；每类标题显示最后刷新时间
-- **清除判定**：只清除当前 PASS/FAIL 判定，不停止持续采集
-- **随机模拟**：一键调用 `/api/debug/random-env` 生成全套随机虚拟环境并启用；持续采集会自动读取最新模拟数据，点击“开始检测”即可判定当前结果是否一致
-- **远程环境判定接口**：控制端启用远程环境模拟后，会通过 `/api/remote/status` 发布当前 Consumer 远程模式、设备/服务端标识、更新时间以及模块当前生效的 location/env 快照。独立检测器读取该接口后，在远程模式下按模块当前实际生效快照判定；未启用远程模式时继续使用传统本地模拟期望配置。只有点击“开始远程测试”后才建立 Collector WebSocket。开始/停止远程测试按钮只控制采集端发包，不会启动、停止或改变本地持续采集与判定；服务端 ACK 与序号用于确认服务端接收状态
-- **远程判定模式状态**：检测器顶部会显示当前使用“远程环境模拟判定”或“本地模拟判定”。远程模式只有在模块控制端已启用远程模式、选中设备且 Consumer WebSocket 已连接时才为真。
-- 服务端 URL、Token、Device ID、最近测试状态和结果会保存在检测器私有设置中
-- **刷新全部信息**：在服务端调试信息与位置信息之间，强制重新注册位置、基站、WiFi、BLE、GNSS、传感器监听并立即执行一次全量扫描/刷新
-- **生命周期结束**：仅在 Activity 被销毁时停止刷新、注销监听器并清理资源；页面内的“清除判定”不会停止采集
+首次启动后按 Android 系统提示授予必要权限。安装或更新系统级测试组件后，是否需要重启取决于目标设备的测试环境配置；应以测试环境状态和日志为准。
 
----
+## 推荐测试流程
 
-## 5. 与模块 API 的交互
+1. 安装 APK，授予本次测试所需权限；
+2. 启动测试控制端，创建或导入一个可重复的测试配置；
+3. 在检测器中确认各项监听器已注册并等待数据刷新；
+4. 点击开始校验，记录各测试项状态、实读摘要和更新时间；
+5. 对配置切换、设备重连、进程重启和权限变化分别执行回归用例；
+6. 将结果与日志、测试配置版本和设备系统版本一起归档；
+7. 测试完成后关闭测试数据并确认 Android API 恢复到预期的默认状态。
 
-- 端口：`127.0.0.1:18790`
-- 鉴权：`X-ZVE-Token` 请求头（从本 APK `assets/api_token.txt` 读取，须与模块 APK 内 token 一致）
-- 网络：raw TCP Socket 直连（与模块 EnvStateCache 一致，绕过系统代理/Tun 与 cleartext 策略）
-- 线程：所有网络调用在后台线程执行，UI 更新回主线程（避免 NetworkOnMainThread）
+自动化测试可调用测试控制端提供的本地 API，先加载固定测试配置，再启动检测器并读取报告结果。报告中的 `PASS` 只应作为一条断言，仍需结合权限、进程状态、系统日志和数据更新时间判断失败原因。
 
-调用的接口：
+## 本地接口
+
+检测器通过受保护的本地 HTTP 接口读取测试状态和提交报告。默认地址为 `127.0.0.1:18790`，请求需要配置约定的认证头；认证值应通过本地测试环境安全注入，不要将真实值写入公开文档、Issue 或日志。
+
+常用接口类别如下：
 
 | 方法 | 路径 | 用途 |
-|---|---|---|
-| GET | `/api/env/status` | 期望环境配置（wifi/cell/ble/sensor/gnss） |
-| GET | `/api/location/status` | 期望位置 |
-| GET | `/api/route/status` | 期望路线/步频 |
-| POST | `/api/debug/random-env` | 随机模拟（一键生成并启用全套环境） |
-| POST | `/api/test/report` | 上报检测报告 |
+| --- | --- | --- |
+| `GET` | `/api/status`、`/api/env/status` | 服务和测试项状态 |
+| `GET` | `/api/location/status`、`/api/route/status` | 位置或轨迹测试状态 |
+| `GET` | `/api/remote/status` | 远程测试会话和数据快照状态 |
+| `POST` | `/api/debug/load-sample-profile` | 加载可重复的示例测试配置 |
+| `POST` | `/api/test/report` | 提交或查询测试结果 |
 
-### Token 说明
+接口名称以当前测试控制端实现为准。未授权请求应视为失败，并在测试报告中记录为接口或配置问题，而不是数据校验失败。
 
-- Token 必须与模块 APK 中的 `assets/api_token.txt` **完全相同**。
-- 未带 Token 或 Token 错误时，模块服务不返回任何字节直接断开（fail-closed）。
-- 更换 Token 时需同步更新两个工程并重新打包。
+## 故障排查
 
----
+- **数据为空或显示 `UNKNOWN`**：检查运行时权限、系统能力、监听器注册状态和最近更新时间；
+- **配置切换后短暂 `SYNCING`**：等待同步窗口结束，再重新执行一次校验；
+- **持续 `FAIL`**：核对测试配置版本、测试项开关、设备系统版本和测试进程状态，并保存日志；
+- **远程数据不更新**：检查 WebSocket 连接、设备在线状态、数据时间戳、序号和服务端 ACK；
+- **报告提交失败**：检查本地服务是否运行、认证配置是否一致，以及是否误用了代理或错误端口；
+- **升级后行为变化**：清理旧测试配置，重新执行最小示例配置和单项 API 读取，再扩大到完整回归。
 
-## 6. Root 支持
+## 目录结构
 
-检测器内置 Root 检测（`su -c id`），UI 顶部显示：
-
-- `Root: 可用（可验证模块存在）`
-- `Root: 不可用（检测器无法感知被 HMA 隐藏的模块，建议授予 Root）`
-
-适用场景：
-
-- 系统装有 **HideMyAppList / HMA** 等隐藏模块的应用；
-- 需要直接读取模块在 `/data/system` 下的持久化配置以确认模块存在与配置内容。
-
-**如果要用 Root 直读模块配置，请在 Magisk 中为 VirEnvDetector 授权 Root。**
-
----
-
-## 7. 实时配置刷新机制
-
-模块侧（保证 Hook 层数据及时）：
-
-- `EnvStateCache` 500ms 轮询 `/api/env/status`
-- BLE：`startScan` 未就绪时暂存回调，配置到达后自动补投递虚拟结果
-- GNSS：300ms 周期投递虚拟卫星状态，快速覆盖真实回调
-- 传感器：pending + refresh 补启动注入
-
-检测器侧（避免瞬时误判）：
-
-- 每秒拉取期望配置并计算指纹
-- 配置变化后 2s 宽限期内 FAIL → SYNCING
-- `random-env` 成功后等待 900ms 再注册监听，确保模块缓存已追平
-
----
-
-## 8. 目录结构
-
-```
+```text
 VirEnvDetector/
-├── app/
-│   └── src/main/
-│       ├── AndroidManifest.xml        # 定位/蓝牙/WiFi/电话权限
-│       ├── assets/api_token.txt       # 与模块一致的 API Token
-│       ├── java/io/github/fairyxh/VirEnvDetector/
-│       │   └── MainActivity.kt        # 全部检测逻辑（单文件实现）
-│       └── res/values/strings.xml
-├── build.gradle.kts                   # 工程级（复用主模块 Gradle 版本）
+├── app/src/main/
+│   ├── AndroidManifest.xml
+│   ├── java/.../VirEnvDetector/MainActivity.kt
+│   ├── assets/                 # 测试环境资源，不应提交真实凭据
+│   └── res/
+├── build.gradle.kts
 ├── settings.gradle.kts
-└── gradle.properties / local.properties
+└── gradle.properties
 ```
 
-> `MainActivity.kt` 为单文件实现：UI、实读、判定、API 客户端、Root 检测均在类内，
-> 便于快速阅读与维护。
+项目采用独立 Gradle 工程，便于单独构建、安装和在黑盒应用侧执行兼容性验证。
 
----
+## 兼容性说明
 
-## 9. 常见问题排查
+- 以 Android 10+ 为基础目标；
+- 不同 Android 版本和设备厂商可能改变权限、扫描结果、电话信息可见性、GNSS 回调时序和传感器事件频率；
+- 设备适配应按“API 签名、运行时权限、回调时序、数据字段、异常路径”逐项验证；
+- 未验证的系统版本不应标记为已支持；建议在 README、测试报告和 CI 产物中记录 API 级别、系统版本、设备类型与验证日期；
+- 缺少能力或测试适配失败时，应将结果标记为 `UNKNOWN` 或 `NOT_ENABLED`，避免把平台限制误报为应用缺陷。
 
-### 9.1 六项全部 NOT_ENABLED
+## 公开发布说明
 
-- 模块 Backend 未运行（未在 LSPosed 启用/未重启）
-- 检测器 Token 与模块不一致 → API 被拒（表现为无期望配置）
-- 检查：`adb logcat -s VirEnvDetector:I` 是否有 `token=loaded len=48`
+本项目仅用于软件开发、调试、自动化测试和兼容性验证。公开材料不包含具体第三方应用、第三方服务适配、内部系统分析记录或真实认证信息。使用者应确保测试设备、测试对象和数据处理均处于合法授权范围内。
 
-### 9.2 某项 FAIL 且读数为真实数据
+## 许可证
 
-- 模块该类型未启用 → 正常（应显示 NOT_ENABLED；若显示 FAIL 说明期望已启用）
-- 配置刚切换 → 等待 2s 后应为 PASS 或 SYNCING
-- Hook 未在检测器进程生效：
-  - 确认检测器在 `scope.list` 中
-  - 模块更新后需 `adb reboot`
-  - 若系统装有 HMA，改用 Root 模式验证
-
-### 9.3 GNSS 波动 / 读到真实卫星
-
-- 已修复为拦截 `registerGnssStatusCallback` + 300ms 周期投递；若仍复现请更新模块到最新构建
-- 参考模块 `docs/reverse/env-live-test-and-hook-fixes.md`
-
-### 9.4 报告未上报
-
-- `/api/test/report` 需要有效 Token
-- 检测器日志出现 `api POST ... failed: null` 时检查 Token 与网络（raw TCP 应绕过代理）
-
----
-
-## 10. 验证示例（全链路 PASS）
-
-```
-location: PASS | provider=gps
-cell:     PASS | LTE mcc=460 mnc=11 tac=24236 ci=240160428 pci=428
-ble:      PASS | ZVE-Device-0 AA:BB:CC:DB:29:C3
-wifi:     PASS | ZVE-Rand-0 ...
-sensor:   PASS | 计步器步数: 15801
-gnss:     PASS | 卫星总数: 16 使用: 5
-```
-
----
-
-## 11. 关联工程
-
-| 工程 | 说明 |
-|---|---|
-| `../ZhangVirtualEnv` | 环境虚拟化模块（控制端 + Backend + Hook） |
-| `../ZhangVirtualEnv/docs/reverse/` | 逆向分析文档与真机验证脚本（新 Agent 先读这里） |
-
----
-
-## 12. 许可证
-
-与 ZhangVirtualEnv 主仓库相同（见 `../ZhangVirtualEnv/LICENSE`）。
+见仓库根目录 `LICENSE`。
