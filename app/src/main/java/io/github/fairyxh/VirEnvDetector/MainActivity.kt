@@ -58,11 +58,15 @@ import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.SSLContext
+import javax.net.ssl.X509TrustManager
 
 /**
  * VirEnvDetector：普通 App 视角的环境虚拟化检测器。
@@ -138,7 +142,20 @@ class MainActivity : Activity() {
     private lateinit var remoteStatus: TextView
     private lateinit var remoteResult: TextView
     private var remoteSocket: WebSocket? = null
-    private val remoteClient = OkHttpClient.Builder().pingInterval(10, java.util.concurrent.TimeUnit.SECONDS).build()
+    private val remoteTrustManager = object : X509TrustManager {
+        override fun checkClientTrusted(chain: Array<out X509Certificate>, authType: String) = Unit
+        override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) = Unit
+        override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+    }
+    private val remoteSslSocketFactory = SSLContext.getInstance("TLS").apply {
+        init(null, arrayOf(remoteTrustManager), SecureRandom())
+    }.socketFactory
+    private val remoteClient = OkHttpClient.Builder()
+        // Test-framework endpoint: accept the currently expired test certificate.
+        .sslSocketFactory(remoteSslSocketFactory, remoteTrustManager)
+        .hostnameVerifier { _, _ -> true }
+        .pingInterval(10, java.util.concurrent.TimeUnit.SECONDS)
+        .build()
     private var remoteSequence = 0
     private val remoteTestRunning = AtomicBoolean(false)
     private val remoteAuthenticated = AtomicBoolean(false)
