@@ -156,15 +156,15 @@ class MainActivity : Activity() {
         .hostnameVerifier { _, _ -> true }
         .pingInterval(10, java.util.concurrent.TimeUnit.SECONDS)
         .build()
-    private var remoteSequence = 0
+    private var remoteSequence = 0L
     private val remoteTestRunning = AtomicBoolean(false)
     private val remoteAuthenticated = AtomicBoolean(false)
     private val remoteAckedTypes = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    private val remoteAckedSequences = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val remoteAckedSequences = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val remoteAckAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val remoteUploadExpected = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
     private val remoteExpectedHistory = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedDeque<JSONObject>>()
-    private val remoteNextSequences = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val remoteNextSequences = java.util.concurrent.ConcurrentHashMap<String, Long>()
     @Volatile
     private var remoteLastUploadSummary = "尚未上传数据"
     private val running = AtomicBoolean(false)
@@ -687,7 +687,7 @@ class MainActivity : Activity() {
             .putString(KEY_REMOTE_TOKEN, remoteTokenInput.text.toString().trim())
             .putString(KEY_REMOTE_DEVICE, remoteDeviceInput.text.toString().trim())
             .apply()
-        remoteSequence = System.currentTimeMillis().toInt()
+        remoteSequence = 0L
         remoteAckedTypes.clear()
         remoteAckedSequences.clear()
         remoteAckAt.clear()
@@ -703,7 +703,7 @@ class MainActivity : Activity() {
             override fun onOpen(ws: WebSocket, response: Response) {
                 ws.send(JSONObject().apply {
                     put("type", "auth"); put("role", "collector"); put("token", token); put("device_id", deviceId)
-                    put("device", JSONObject().apply { put("name", "VirEnvDetector"); put("device_type", "android-test"); put("capabilities", JSONArray(listOf("bluetooth", "wifi", "cell"))) })
+                    put("device", JSONObject().apply { put("name", "VirEnvDetector"); put("device_type", "android-test"); put("capabilities", JSONArray(listOf("bluetooth", "wifi", "cell", "gps", "gnss", "sensor"))) })
                 }.toString())
                 runOnUiThread { remoteStatus.text = "已连接，认证中…" }
             }
@@ -719,8 +719,8 @@ class MainActivity : Activity() {
                         }
                     }
                     "data_result" -> {
-                        val type = msg.optString("data_type")
-                        val sequence = msg.optInt("sequence", -1)
+                        val type = canonicalRemoteType(msg.optString("data_type"))
+                        val sequence = msg.optLong("sequence", -1L)
                         remoteAckedTypes += type
                         remoteAckedSequences[type] = sequence
                         remoteAckAt[type] = System.currentTimeMillis()
@@ -765,6 +765,24 @@ class MainActivity : Activity() {
             }
         })
         refreshExecutor.execute { remoteUploadLoop() }
+    }
+
+    private fun canonicalRemoteType(value: String): String = when (value) {
+        "bluetooth", "ble", "bluetooth_data" -> "bluetooth"
+        "cellular" -> "cell"
+        else -> value
+    }
+
+    private fun stopRemoteUploadTest() {
+        remoteTestRunning.set(false)
+        remoteAuthenticated.set(false)
+        remoteSocket?.close(1000, "detector stop")
+        remoteSocket = null
+        val summary = buildRemoteComparisonResult()
+        if (::remoteResult.isInitialized) {
+            remoteResult.text = summary
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_REMOTE_RESULT, summary).apply()
+        }
     }
 
     private fun buildRemoteComparisonResult(): String {
@@ -836,7 +854,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun rememberRemoteExpectation(type: String, value: JSONObject, sequence: Int) {
+    private fun rememberRemoteExpectation(type: String, value: JSONObject, sequence: Long) {
         remoteUploadExpected[type] = JSONObject(value.toString())
         val history = remoteExpectedHistory.computeIfAbsent(type) { java.util.concurrent.ConcurrentLinkedDeque() }
         history.addLast(JSONObject(value.toString()).apply {
@@ -853,28 +871,41 @@ class MainActivity : Activity() {
                 continue
             }
             val deviceId = remoteDeviceInput.text.toString().trim()
-            fun nextSequence(type: String): Int {
+            fun nextSequence(type: String): Long {
                 return remoteNextSequences.compute(type) { _, previous ->
-                    (previous ?: (System.currentTimeMillis() / 1000L).toInt()) + 1
-                } ?: 1
+                    maxOf(System.currentTimeMillis(), (previous ?: 0L) + 1L)
+                } ?: System.currentTimeMillis()
             }
             val bluetoothSequence = nextSequence("bluetooth")
             val wifiSequence = nextSequence("wifi")
             val cellSequence = nextSequence("cell")
-            val bluetooth = buildSimulatedBluetooth(bluetoothSequence)
-            val wifi = buildSimulatedWifi(wifiSequence)
-            val cell = buildSimulatedCell(cellSequence)
+            val gpsSequence = nextSequence("gps")
+            val gnssSequence = nextSequence("gnss")
+            val sensorSequence = nextSequence("sensor")
+            val bluetooth = buildSimulatedBluetooth(bluetoothSequence.toInt())
+            val wifi = buildSimulatedWifi(wifiSequence.toInt())
+            val cell = buildSimulatedCell(cellSequence.toInt())
+            val gps = buildSimulatedGps(gpsSequence)
+            val gnss = buildSimulatedGnss(gnssSequence)
+            val sensor = buildSimulatedSensor(sensorSequence)
             rememberRemoteExpectation("bluetooth", bluetooth, bluetoothSequence)
             rememberRemoteExpectation("wifi", wifi, wifiSequence)
             rememberRemoteExpectation("cell", cell, cellSequence)
+            rememberRemoteExpectation("gps", gps, gpsSequence)
+            rememberRemoteExpectation("gnss", gnss, gnssSequence)
+            rememberRemoteExpectation("sensor", sensor, sensorSequence)
             listOf(
                 Triple("bluetooth", bluetooth, bluetoothSequence),
                 Triple("wifi", wifi, wifiSequence),
                 Triple("cell", cell, cellSequence),
+                Triple("gps", gps, gpsSequence),
+                Triple("gnss", gnss, gnssSequence),
+                Triple("sensor", sensor, sensorSequence),
             ).forEach { (type, value, sequence) ->
+                val dataType = type
                 remoteSocket?.send(JSONObject().apply {
                     put("type", "environment_data"); put("version", 1); put("device_id", deviceId)
-                    put("data_type", type); put("timestamp", System.currentTimeMillis())
+                    put("data_type", dataType); put("timestamp", System.currentTimeMillis())
                     put("sequence", sequence); put("data", value)
                 }.toString())
             }
@@ -884,15 +915,56 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun stopRemoteUploadTest() {
-        remoteTestRunning.set(false)
-        remoteAuthenticated.set(false)
-        remoteSocket?.close(1000, "detector stop")
-        remoteSocket = null
-        val summary = buildRemoteComparisonResult()
-        if (::remoteResult.isInitialized) {
-            remoteResult.text = summary
-            getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putString(KEY_REMOTE_RESULT, summary).apply()
+    /** Builds a canonical GPS fix payload; location remains the authoritative module position source. */
+    private fun buildSimulatedGps(sequence: Long): JSONObject {
+        val now = System.currentTimeMillis()
+        val lat = 39.9042 + (sequence % 100).toDouble() * 0.00001
+        val lon = 116.4074 + (sequence % 100).toDouble() * 0.00001
+        return JSONObject().apply {
+            put("fix_at", now)
+            put("provider", "gps")
+            put("latitude", lat)
+            put("longitude", lon)
+            put("altitude_m", 43.2)
+            put("accuracy_m", 5.8)
+            put("speed_mps", 1.2)
+            put("bearing_deg", 90.0)
+            put("satellites", 18)
+            put("fix_quality", "3d")
+            put("mocked", true)
+            put("points", JSONArray().put(JSONObject().apply {
+                put("timestamp", now); put("latitude", lat); put("longitude", lon)
+                put("altitude_m", 43.2); put("accuracy_m", 5.8)
+            }))
+        }
+    }
+
+    /** Builds deterministic satellite rows using the documented MHz wire unit. */
+    private fun buildSimulatedGnss(sequence: Long): JSONObject {
+        val now = System.currentTimeMillis()
+        val satellites = JSONArray()
+        listOf("gps" to 1575.42, "beidou" to 1561.098, "galileo" to 1575.42, "glonass" to 1602.0).forEachIndexed { index, (type, frequency) ->
+            satellites.put(JSONObject().apply {
+                put("type", type); put("svid", 12 + index + (sequence % 3).toInt())
+                put("azimuth_deg", 45.0 + index * 70.0); put("elevation_deg", 30.0 + index * 8.0)
+                put("frequency_mhz", frequency); put("snr_db", 28.0 + index * 2.5)
+                put("almanac", true); put("ephemeris", true); put("used", index < 3)
+            })
+        }
+        return JSONObject().apply { put("fix_at", now); put("constellation", "multi"); put("satellites", satellites) }
+    }
+
+    /** Builds a bounded sensor sample payload with explicit units and epoch timestamps. */
+    private fun buildSimulatedSensor(sequence: Long): JSONObject {
+        val now = System.currentTimeMillis()
+        return JSONObject().apply {
+            put("sensor", "accelerometer"); put("unit", "m/s2"); put("sampling_hz", 50.0)
+            put("samples", JSONArray().put(JSONObject().apply {
+                put("timestamp", now); put("x", 0.01 + (sequence % 3).toDouble() * 0.01); put("y", 9.80); put("z", 0.12)
+            }))
+            put("readings", JSONArray().apply {
+                put(JSONObject().apply { put("timestamp", now); put("sensor", "step_counter"); put("value", 1280L + sequence); put("unit", "steps") })
+            })
         }
     }
 
