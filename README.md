@@ -5,7 +5,7 @@ VirEnvDetector 是一个独立的 Android 测试校验工具，用于从应用�
 ## 能力概览
 
 - 持续读取位置、轨迹、GNSS、蜂窝网络、Wi-Fi、Bluetooth/BLE、传感器和订阅信息；
-- 可选远程 Collector 测试按服务端 v1 标准上传 Bluetooth、WiFi、Cell、GPS、GNSS、Sensor 六类数据，并验证 ACK/序列号；
+- 可选远程 Collector 测试按服务端 v1 标准上传 Bluetooth、WiFi、Cell、GPS、GNSS、Sensor、Environment、Other 八类数据，并验证 ACK/序列号；
 - 展示原始读取摘要、最近更新时间和当前校验状态；
 - 将实读结果与测试配置或远程采集快照进行逐项比对；
 - 支持单次校验、持续刷新、配置切换后的同步等待和结果清理；

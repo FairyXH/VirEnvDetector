@@ -790,7 +790,7 @@ class MainActivity : Activity() {
         val ackTypes = remoteAckedTypes.toSet()
         val uploadedPresent = expectedTypes.isNotEmpty() && expectedTypes.all { it in ackTypes }
         val wifiExpected = remoteExpectedHistory["wifi"]?.lastOrNull()?.optJSONArray("networks")
-        val cellExpected = remoteExpectedHistory["cell"]?.lastOrNull()?.optJSONArray("entries")
+        val cellExpected = remoteExpectedHistory["cell"]?.lastOrNull()?.let { cellExpectedItems(it) }
         val bleExpected = remoteExpectedHistory["bluetooth"]?.lastOrNull()?.optJSONArray("devices")
         val wifiMatched = (0 until (wifiExpected?.length() ?: 0)).count { index ->
             val item = wifiExpected?.optJSONObject(index) ?: return@count false
@@ -854,6 +854,13 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun cellExpectedItems(data: JSONObject): JSONArray = JSONArray().apply {
+        data.optJSONObject("serving")?.let(::put)
+        data.optJSONArray("neighbors")?.let { rows ->
+            for (index in 0 until rows.length()) rows.optJSONObject(index)?.let(::put)
+        }
+    }
+
     private fun rememberRemoteExpectation(type: String, value: JSONObject, sequence: Long) {
         remoteUploadExpected[type] = JSONObject(value.toString())
         val history = remoteExpectedHistory.computeIfAbsent(type) { java.util.concurrent.ConcurrentLinkedDeque() }
@@ -882,18 +889,24 @@ class MainActivity : Activity() {
             val gpsSequence = nextSequence("gps")
             val gnssSequence = nextSequence("gnss")
             val sensorSequence = nextSequence("sensor")
-            val bluetooth = buildSimulatedBluetooth(bluetoothSequence.toInt())
-            val wifi = buildSimulatedWifi(wifiSequence.toInt())
-            val cell = buildSimulatedCell(cellSequence.toInt())
+            val bluetooth = buildSimulatedBluetooth(bluetoothSequence)
+            val wifi = buildSimulatedWifi(wifiSequence)
+            val cell = buildSimulatedCell(cellSequence)
             val gps = buildSimulatedGps(gpsSequence)
             val gnss = buildSimulatedGnss(gnssSequence)
             val sensor = buildSimulatedSensor(sensorSequence)
+            val environment = buildSimulatedEnvironment()
+            val other = buildSimulatedOther()
             rememberRemoteExpectation("bluetooth", bluetooth, bluetoothSequence)
             rememberRemoteExpectation("wifi", wifi, wifiSequence)
             rememberRemoteExpectation("cell", cell, cellSequence)
             rememberRemoteExpectation("gps", gps, gpsSequence)
             rememberRemoteExpectation("gnss", gnss, gnssSequence)
             rememberRemoteExpectation("sensor", sensor, sensorSequence)
+            val environmentSequence = nextSequence("environment")
+            val otherSequence = nextSequence("other")
+            rememberRemoteExpectation("environment", environment, environmentSequence)
+            rememberRemoteExpectation("other", other, otherSequence)
             listOf(
                 Triple("bluetooth", bluetooth, bluetoothSequence),
                 Triple("wifi", wifi, wifiSequence),
@@ -901,6 +914,8 @@ class MainActivity : Activity() {
                 Triple("gps", gps, gpsSequence),
                 Triple("gnss", gnss, gnssSequence),
                 Triple("sensor", sensor, sensorSequence),
+                Triple("environment", environment, environmentSequence),
+                Triple("other", other, otherSequence),
             ).forEach { (type, value, sequence) ->
                 val dataType = type
                 remoteSocket?.send(JSONObject().apply {
@@ -918,8 +933,19 @@ class MainActivity : Activity() {
     /** Builds a canonical GPS fix payload; location remains the authoritative module position source. */
     private fun buildSimulatedGps(sequence: Long): JSONObject {
         val now = System.currentTimeMillis()
-        val lat = 39.9042 + (sequence % 100).toDouble() * 0.00001
-        val lon = 116.4074 + (sequence % 100).toDouble() * 0.00001
+        val offset = (sequence % 100).toDouble() * 0.00001
+        val lat = 39.9042 + offset
+        val lon = 116.4074 + offset
+        val points = JSONArray()
+        repeat(3) { index ->
+            points.put(JSONObject().apply {
+                put("timestamp", now + index * 1000L)
+                put("latitude", lat + index * 0.0001)
+                put("longitude", lon + index * 0.0001)
+                put("altitude_m", 43.2 + index.toDouble())
+                put("accuracy_m", 5.8)
+            })
+        }
         return JSONObject().apply {
             put("fix_at", now)
             put("provider", "gps")
@@ -932,10 +958,7 @@ class MainActivity : Activity() {
             put("satellites", 18)
             put("fix_quality", "3d")
             put("mocked", true)
-            put("points", JSONArray().put(JSONObject().apply {
-                put("timestamp", now); put("latitude", lat); put("longitude", lon)
-                put("altitude_m", 43.2); put("accuracy_m", 5.8)
-            }))
+            put("points", points)
         }
     }
 
@@ -958,18 +981,19 @@ class MainActivity : Activity() {
     private fun buildSimulatedSensor(sequence: Long): JSONObject {
         val now = System.currentTimeMillis()
         return JSONObject().apply {
-            put("sensor", "accelerometer"); put("unit", "m/s2"); put("sampling_hz", 50.0)
+            put("sensor_type", "accelerometer"); put("sensor", "accelerometer"); put("unit", "m/s2"); put("sampling_hz", 50.0)
+            put("timestamp", now); put("value", 9.81); put("values", JSONArray(listOf(0.01, 9.80, 0.12)))
             put("samples", JSONArray().put(JSONObject().apply {
-                put("timestamp", now); put("x", 0.01 + (sequence % 3).toDouble() * 0.01); put("y", 9.80); put("z", 0.12)
+                put("timestamp", now); put("x", 0.01 + (sequence % 3).toDouble() * 0.01); put("y", 9.80); put("z", 0.12); put("value", 9.81)
             }))
             put("readings", JSONArray().apply {
-                put(JSONObject().apply { put("timestamp", now); put("sensor", "step_counter"); put("value", 1280L + sequence); put("unit", "steps") })
+                put(JSONObject().apply { put("timestamp", now); put("x", 0.0); put("y", 0.0); put("z", 0.0); put("value", 1280.0 + sequence); put("sensor", "step_counter"); put("unit", "steps") })
             })
         }
     }
 
     /** Matches the generic Collector wire format and deliberately covers every Bluetooth mode. */
-    private fun buildSimulatedBluetooth(sequence: Int): JSONObject {
+    private fun buildSimulatedBluetooth(sequence: Long): JSONObject {
         val rawHex = "0201060AFF4C0002151112131415161718190001C5"
         val rawBytes = ByteArray(rawHex.length / 2) { i -> rawHex.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
         val raw = android.util.Base64.encodeToString(rawBytes, android.util.Base64.NO_WRAP)
@@ -980,45 +1004,115 @@ class MainActivity : Activity() {
         listOf("ble", "dual", "classic").forEachIndexed { index, mode ->
             val address = String.format("02:00:%02X:%02X:%02X:%02X", sequence and 0xff, index, (sequence shr 8) and 0xff, (sequence + index) and 0xff)
             devices.put(JSONObject().apply {
-                put("name", "Detector-BT-$sequence-$mode"); put("address", address); put("rssi", -45 - index * 5); put("mode", mode)
-                put("classic_rssi", -50 - index * 4); put("classicRssi", -50 - index * 4)
-                put("class_of_device", 2360324 + index); put("classOfDevice", 2360324 + index)
+                put("name", "Detector-BT-$sequence-$mode"); put("address", address); put("address_type", "public")
+                put("rssi", (-45 - index * 5).toDouble()); put("is_connected", false); put("is_paired", false)
+                put("mode", mode); put("classic_rssi", (-50 - index * 4).toDouble()); put("class_of_device", 2360324 + index)
+                put("timestamp", System.currentTimeMillis())
                 if (mode != "classic") {
-                    put("tx_power", -4 + index); put("txPower", -4 + index); put("uuid", uuid)
-                    put("service_uuids", JSONArray(listOf(uuid))); put("serviceUuids", JSONArray(listOf(uuid)))
-                    put("manufacturer_data", JSONObject().put("76", manufacturer)); put("manufacturerData", JSONObject().put("76", manufacturer))
-                    put("service_data", JSONObject().put(uuid, service)); put("serviceData", JSONObject().put(uuid, service))
-                    put("raw", raw); put("raw_hex", rawHex); put("rawHex", rawHex); put("raw_length", rawBytes.size); put("rawLength", rawBytes.size)
+                    put("tx_power", (-4 + index).toDouble()); put("manufacturer_id", 76)
+                    put("service_uuids", JSONArray(listOf(uuid)))
+                    put("manufacturer_data", manufacturer)
+                    put("service_data", JSONObject().put(uuid, service))
+                    put("raw", raw); put("rawHex", rawHex); put("rawLength", rawBytes.size)
+                } else {
+                    // Classic-only rows must not fabricate BLE ScanRecord fields.
+                    put("is_paired", true)
                 }
             })
         }
-        return JSONObject().put("devices", devices)
+        return JSONObject().apply {
+            put("scan_started_at", System.currentTimeMillis() - 500L)
+            put("scan_finished_at", System.currentTimeMillis())
+            put("technology", "ble")
+            put("is_enabled", true)
+            put("devices", devices)
+        }
     }
 
     /** Covers 2.4 GHz, 5 GHz, and 6 GHz WiFi records. */
-    private fun buildSimulatedWifi(sequence: Int): JSONObject {
+    private fun buildSimulatedWifi(sequence: Long): JSONObject {
         val raw = android.util.Base64.encodeToString("simulated-wifi-scan-$sequence".toByteArray(StandardCharsets.UTF_8), android.util.Base64.NO_WRAP)
         val channels = listOf(2412 to "[WPA2-PSK-CCMP]", 5180 to "[WPA3-SAE-CCMP]", 5955 to "[WPA3-SAE-CCMP]")
         val networks = JSONArray()
         channels.forEachIndexed { index, (frequency, capabilities) ->
             networks.put(JSONObject().apply {
                 put("ssid", "Detector-WiFi-$sequence-$index"); put("bssid", String.format("AA:BB:%02X:%02X:%02X:%02X", sequence and 0xff, index, (sequence shr 8) and 0xff, (sequence + index) and 0xff))
-                put("rssi", -40 - index * 6); put("frequency", frequency); put("capabilities", capabilities)
+                put("rssi", (-40 - index * 6).toDouble()); put("signal_dbm", (-40 - index * 6).toDouble())
+                put("frequency_mhz", frequency.toDouble())
+                put("frequency", frequency)
+                put("channel", when (frequency) { 2412 -> 1; 5180 -> 36; else -> 1 })
+                put("band", when (frequency) { 2412 -> "2_4ghz"; 5180 -> "5ghz"; else -> "6ghz" })
+                put("security", JSONArray(listOf(if (index == 1) "WPA3-SAE" else "WPA2-PSK")))
+                put("capabilities", capabilities)
+                put("hidden", false)
+                put("timestamp", System.currentTimeMillis())
             })
         }
-        return JSONObject().put("raw", raw).put("networks", networks)
+        return JSONObject().apply {
+            put("scan_started_at", System.currentTimeMillis() - 500L)
+            put("scan_finished_at", System.currentTimeMillis())
+            put("interface", "wlan0")
+            put("is_connected", true)
+            put("gateway", "192.0.2.1")
+            put("dns_servers", JSONArray(listOf("192.0.2.53")))
+            put("ip_address", "192.0.2.10")
+            put("raw", raw)
+            put("networks", networks)
+        }
     }
 
     /** Covers LTE, NR, WCDMA, GSM, and CDMA using the server's entries schema. */
-    private fun buildSimulatedCell(sequence: Int): JSONObject {
-        val entries = JSONArray()
-        entries.put(JSONObject().apply { put("type", "LTE"); put("mcc", 460); put("mnc", 11); put("tac", 12000 + sequence % 1000); put("ci", 240160000L + sequence % 100000); put("pci", 100); put("arfcn", 1650); put("rsrp", -95); put("rsrq", -10) })
-        entries.put(JSONObject().apply { put("type", "NR"); put("mcc", 460); put("mnc", 11); put("tac", 22000 + sequence % 1000); put("nci", 68719476736L + sequence % 100000); put("pci", 200); put("arfcn", 635334); put("rsrp", -88); put("rsrq", -9) })
-        entries.put(JSONObject().apply { put("type", "WCDMA"); put("mcc", 460); put("mnc", 11); put("lac", 3000); put("cid", 310000 + sequence % 10000); put("arfcn", 10564); put("rssi", -72) })
-        entries.put(JSONObject().apply { put("type", "GSM"); put("mcc", 460); put("mnc", 11); put("lac", 4000); put("cid", 410000 + sequence % 10000); put("arfcn", 62); put("rssi", -78) })
-        entries.put(JSONObject().apply { put("type", "CDMA"); put("sid", 42); put("nid", 7); put("bid", 100 + sequence % 1000); put("latitude", 3100000); put("longitude", 12100000); put("rssi", -80) })
+    private fun buildSimulatedCell(sequence: Long): JSONObject {
+        fun observation(type: String, identity: JSONObject): JSONObject = JSONObject().apply {
+            put("radio", type.lowercase()); put("technology", type); put("mcc", "460"); put("mnc", "11")
+            put("signal_dbm", -90.0); put("asu", 20.0); put("rsrp", -95.0); put("rsrq", -10.0)
+            keysOf(identity).forEach { key -> put(key, identity.opt(key)) }
+        }
+        val neighbors = JSONArray()
+            .put(observation("NR", JSONObject().put("tac", 22000L + sequence % 1000).put("pci", 200).put("arfcn", 635334L).put("nci", 68719476736L + sequence % 100000)))
+            .put(observation("WCDMA", JSONObject().put("lac", 3000L).put("cid", 310000L + sequence % 10000).put("arfcn", 10564L)))
+            .put(observation("GSM", JSONObject().put("lac", 4000L).put("cid", 410000L + sequence % 10000).put("arfcn", 62L)))
+            .put(observation("CDMA", JSONObject().put("sid", 42).put("nid", 7).put("bid", 100 + sequence % 1000)))
+        val serving = observation("LTE", JSONObject().put("tac", 12000L + sequence % 1000).put("ci", 240160000L + sequence % 100000).put("pci", 100).put("arfcn", 1650L))
         val raw = android.util.Base64.encodeToString("simulated-cell-scan-$sequence".toByteArray(StandardCharsets.UTF_8), android.util.Base64.NO_WRAP)
-        return JSONObject().put("raw", raw).put("entries", entries)
+        return JSONObject().apply {
+            put("observed_at", System.currentTimeMillis())
+            put("network_type", "LTE")
+            put("sim_slot", 0)
+            put("is_connected", true)
+            put("registered", true)
+            put("serving", serving)
+            put("neighbors", neighbors)
+            // Keep the documented v1 flat alias while serving/neighbors remain canonical.
+            put("entries", JSONArray().apply {
+                put(JSONObject(serving.toString()))
+                for (index in 0 until neighbors.length()) {
+                    neighbors.optJSONObject(index)?.let { put(JSONObject(it.toString())) }
+                }
+            })
+            put("raw", raw)
+        }
+    }
+
+    private fun keysOf(value: JSONObject): List<String> = value.keys().asSequence().toList()
+
+    private fun buildSimulatedEnvironment(): JSONObject = JSONObject().apply {
+        put("timestamp", System.currentTimeMillis())
+        put("readings", JSONObject().apply {
+            put("temperature", JSONObject().put("value", 24.5).put("unit", "degC"))
+            put("humidity", JSONObject().put("value", 48.0).put("unit", "percent"))
+            put("pressure", JSONObject().put("value", 1012.8).put("unit", "hPa"))
+            put("co2", JSONObject().put("value", 620.0).put("unit", "ppm"))
+            put("pm2_5", JSONObject().put("value", 11.5).put("unit", "ug/m3"))
+            put("illuminance", JSONObject().put("value", 180.0).put("unit", "lux"))
+            put("noise", JSONObject().put("value", 36.0).put("unit", "dBA"))
+        })
+    }
+
+    private fun buildSimulatedOther(): JSONObject = JSONObject().apply {
+        put("format", "detector-fixture-v1")
+        put("source", "VirEnvDetector")
+        put("value", "deterministic compatibility fixture")
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
